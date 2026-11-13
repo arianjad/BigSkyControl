@@ -144,6 +144,8 @@ SNAPSHOT, SET, PRESS.
   Q-switch in the next snapshot; it presses `warm_up` at queue end and on abort.
 - Changing a name, range or button: change the menu file and its `version` (BLACS refuses to run
   shots when the versions differ).
+- `LabNotes_BigSky_BLACS_ZMQ.html` describes the **old** link (PUB stream, PROGRAM_VALUE,
+  CHECK_VALUE), not the menu link; kept as history.
 
 **Remote command GUI sync convention:** Every function that changes hardware state (e.g., `setFlashLampExternal`, `toggleShutterStatus`) must also update the corresponding GUI widget (radio button, checkbox, label). When called by user click, the widget is already correct. But when called via ZMQ remote command (`_handleRemoteCommand` -> `_remoteDo`), the widget won't update unless the function explicitly sets it. This also applies to disconnect/reconnect transitions — `_handleDisconnect()` and `_handleReconnect()` must update all GUI elements since no user click triggers the change. Failure to sync causes the GUI to show stale state.
 
