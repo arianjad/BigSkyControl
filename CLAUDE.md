@@ -128,7 +128,9 @@ SNAPSHOT, SET, PRESS.
   `shutter`, `qswitch`, `lamp_mode` (0 int, 1 ext), `qswitch_mode` (0 int, 1 burst, 2 ext) set,
   `temperature` [degC] read only, `keep_warm` set. The GUI refuses: shutter open with lamps
   off, Q-switch on without lamps + shutter, a mode change unless standby, a laser whose serial
-  link is down; a set the laser does not answer or reads back differently is refused too.
+  link is down; a set the laser does not answer is refused too. Voltage, lamp mode and Q-switch
+  mode are read back from the laser, and a different read-back is refused; lamps, shutter and
+  Q-switch count as set once the laser replies anything (the reply is not checked).
 - Buttons: `arm`, `warm_up`, `stop` = `startLaser`, `startWarmup`, `stopLaser`. Each runs its
   steps in order and stops at the first one that fails; the answer is "done" or a refusal
   `failed_at_step` with words like "arm failed at step 5 of 6 (shutter open, >r1): the laser did
