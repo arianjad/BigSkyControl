@@ -159,8 +159,8 @@ LASER_SN_TO_CONNECTION = {
 class BigSkyHub(QMainWindow):
   def __init__(self, noLaser=False):
     """noLaser: the no-laser mode (`--no-laser`): no COM port is scanned or opened; one dummy
-    laser, YAG_1, is open (no serial port), so BLACS can connect, read and press (every press
-    fails at step 1: no serial connection)."""
+    laser, YAG_1, is open (no serial port), so BLACS can connect and read; every set or press
+    is refused at once with laser_disconnected (the laser's serial link is down)."""
     super().__init__()
     self.setWindowTitle('Big Sky Controller Hub' + (' (no laser)' if noLaser else ''))
     self.setWindowIcon(QIcon('BigSkyDesktopIcon.ico'))
