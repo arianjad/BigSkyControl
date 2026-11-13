@@ -15,6 +15,15 @@ import threading
 # don't have to hard-code each command's exact response prefix.
 _TRAILING_INT_RE = re.compile(r'(-?\d+)\s*$')
 
+
+class RemoteRefused(Exception):
+  """A remote (BLACS) request this laser could not do: `code` for programs, `words` for people.
+  HugeSkyController turns it into the menu link's refusal, so BLACS gets both."""
+  def __init__(self, code, words):
+    super().__init__("[%s] %s" % (code, words))
+    self.code = code
+    self.words = words
+
 qtCreatorFile = "GuiBigSkyWidget.ui" # Enter file here.
 
 Ui_Widget, QtBaseClass = uic.loadUiType(qtCreatorFile)
@@ -23,7 +32,6 @@ class SingleLaserController(QtWidgets.QWidget, Ui_Widget):
   #Signal for thread-safe remote command execution from ZMQ daemon thread
   _remoteCommandRequested = pyqtSignal(str, object, object)  # (command, value, future)
   connectionStatusChanged = pyqtSignal(bool)  # emitted on disconnect/reconnect
-  _blacsHelloReceived = pyqtSignal()  # emitted by ZMQ server on HELLO from BLACS
 
   def __init__(self, cPort=-1, lString=''):
     super().__init__()
@@ -34,7 +42,10 @@ class SingleLaserController(QtWidgets.QWidget, Ui_Widget):
     self.calibrationFilePresent=False #TODO: check for calibration file based on laser head serial number
 
     #Testing different possible serial ports to see if any of them is a Big Sky laser. If ">cg" evokes a temperature readout, we found a live one.
+    #cPort=-1 (no laser): no serial port is opened here or later (_attemptReconnect only runs
+    #after a disconnect of a port that was open).
     self.serialConnected = False
+    self.dangerMode = False
     self._consecutiveErrors = 0
     if self.comPort!=-1:
       try:
@@ -78,11 +89,6 @@ class SingleLaserController(QtWidgets.QWidget, Ui_Widget):
 
     #Latched energy readback — set when voltage changes, consumed by next temp poll
     self._energyReadbackPending = False
-
-    #BLACS connection tracking — suppress GUI-side keep-warm when BLACS is in control
-    self._blacsConnected = False
-    self._lastBlacsContact = 0
-    self._blacsHelloReceived.connect(self._onBlacsHello)
 
    #Initializing GUI values
 
@@ -190,7 +196,6 @@ class SingleLaserController(QtWidgets.QWidget, Ui_Widget):
       return  # already disconnected
     self.serialConnected = False
     self._consecutiveErrors = 0
-    self._blacsConnected = False
 
     # Reset all cached hardware state
     with self._stateLock:
@@ -275,12 +280,6 @@ class SingleLaserController(QtWidgets.QWidget, Ui_Widget):
     """Return serial connection status. Thread-safe (GIL-atomic bool read)."""
     return self.serialConnected
 
-  @pyqtSlot()
-  def _onBlacsHello(self):
-    """Received HELLO from BLACS via ZMQ — mark BLACS as connected."""
-    self._blacsConnected = True
-    self._lastBlacsContact = time.time()
-
   # --- Laser commands ---
 
   def setFrequency(self):
@@ -321,26 +320,37 @@ class SingleLaserController(QtWidgets.QWidget, Ui_Widget):
 
   '''NOTE: These can only be changed while laser is in standby (>s). The GUI should now reproduce this behavior'''
   def setQSwitchInternal(self):
-    print(">qsm0")
-    response = self._sendCommand(b'>qsm0\n')
-    if response is not None:
-      self.qSwitchMode = 0; self.qSwitchRadioButton_0.setChecked(True)
-      print("response:", response)
-      self.terminalOutputTextBrowser.append('>qsm0'); self.terminalOutputTextBrowser.append("<p style='color: green'>"+response.strip('\r\n')+"</p>")
+    return self._setQSwitchMode(0)
   def setQSwitchBurst(self):
-    print(">qsm1")
-    response = self._sendCommand(b'>qsm1\n')
-    if response is not None:
-      self.qSwitchMode = 1; self.qSwitchRadioButton_1.setChecked(True)
-      print("response:", response)
-      self.terminalOutputTextBrowser.append('>qsm1'); self.terminalOutputTextBrowser.append("<p style='color: green'>"+response.strip('\r\n')+"</p>");
+    return self._setQSwitchMode(1)
   def setQSwitchExternal(self):
-    print(">qsm2")
-    response = self._sendCommand(b'>qsm2\n')
-    if response is not None:
-      self.qSwitchMode = 2; self.qSwitchRadioButton_2.setChecked(True)
-      print("response:", response)
-      self.terminalOutputTextBrowser.append('>qsm2'); self.terminalOutputTextBrowser.append("<p style='color: green'>"+response.strip('\r\n')+"</p>");
+    return self._setQSwitchMode(2)
+
+  def _setQSwitchMode(self, target):
+    """Send >qsm{target} and verify the mode the laser reports (from the reply, or from a >qsm
+    query when the reply carries no number). Returns the same result dicts as _setLampMode.
+    The cached qSwitchMode and the radio buttons follow the reported mode."""
+    cmd = '>qsm%d' % target
+    response = self._sendCommand((cmd + '\n').encode('ascii'))
+    if response is None:
+      return {"status": "REJECTED", "code": "serial_failure", "message": "serial failure on %s" % cmd}
+    self.terminalOutputTextBrowser.append(cmd)
+    self.terminalOutputTextBrowser.append("<p style='color: green'>"+response.strip('\r\n')+"</p>")
+    m = _TRAILING_INT_RE.search(response.strip())
+    if m is None:                                   # no number in the reply: ask the laser
+      response = self._sendCommand(b'>qsm\n')
+      m = _TRAILING_INT_RE.search(response.strip()) if response is not None else None
+    if m is None:
+      return {"status": "REJECTED", "code": "parse_failure",
+              "message": "could not read the Q-switch mode back after %s" % cmd}
+    actual = int(m.group(1))
+    with self._stateLock: self.qSwitchMode = actual
+    radio = {0: self.qSwitchRadioButton_0, 1: self.qSwitchRadioButton_1, 2: self.qSwitchRadioButton_2}.get(actual)
+    if radio is not None: radio.setChecked(True)
+    if actual != target:
+      return {"status": "REJECTED", "code": "did_not_take_effect",
+              "message": "%s did not take effect (the laser reports %d)" % (cmd, actual)}
+    return {"status": "SUCCESS"}
   def _setLampMode(self, target, cmd_label):
     """Send >lpm{target} and verify the controller's reported mode.
 
@@ -354,7 +364,7 @@ class SingleLaserController(QtWidgets.QWidget, Ui_Widget):
     did not take effect'. The cached flashLampMode is set to the *actual*
     reported value (so callers like ``startLaser`` see reality).
     """
-    cmd_bytes = ('>%s\n' % cmd_label).encode('ascii')
+    cmd_bytes = ('%s\n' % cmd_label).encode('ascii')   # cmd_label is '>lpm0' / '>lpm1' (BBX-189: was '>>lpm1')
     print(cmd_label)
     response = self._sendCommand(cmd_bytes)
     if response is None:
@@ -493,56 +503,63 @@ class SingleLaserController(QtWidgets.QWidget, Ui_Widget):
         print("response:", response)
         self.terminalOutputTextBrowser.append("<p style='color: green'>"+response.strip('\r\n')+"</p>")
 
-  def startLaser(self):
-    """Arm for external-trigger lasing: ensure external modes, then activate all."""
-    if not self.serialConnected:
-      self.terminalOutputTextBrowser.append("<p style='color: red'>Cannot arm: no serial connection</p>")
-      return
-    #Go to standby (required for mode switches — always send, don't trust cache)
-    response = self._sendCommand(b'>s\n')
-    if response is None: return
-    with self._stateLock: self.activeStatus = 0; self.shutterStatus = 0; self.qSwitchStatus = 0
-    self.terminalOutputTextBrowser.append('>s (standby for mode switch)')
-    #Set external lamp mode (always send — don't trust cache)
-    self.setFlashLampExternal()
-    if not self.serialConnected: return
-    if self.flashLampMode != 1:
-      self.terminalOutputTextBrowser.append(
-          "<p style='color: red'>Arm aborted: lamp mode is %d, not external (1)</p>" % self.flashLampMode)
-      return
-    #Activate lamps
-    response = self._sendCommand(b'>a\n')
-    if response is None: return
-    with self._stateLock: self.activeStatus = 1
-    self.terminalOutputTextBrowser.append('>a')
-    self.terminalOutputTextBrowser.append("<p style='color: green'>"+response.strip('\r\n')+"</p>")
-    #Open shutter
-    response = self._sendCommand(b'>r1\n')
-    if response is None: return
-    with self._stateLock: self.shutterStatus = 1
-    self.terminalOutputTextBrowser.append('>r1')
-    self.terminalOutputTextBrowser.append("<p style='color: green'>"+response.strip('\r\n')+"</p>")
-    #Arm Q-switch
-    response = self._sendCommand(b'>pq\n')
-    if response is None: return
-    with self._stateLock: self.qSwitchStatus = 1
-    self.terminalOutputTextBrowser.append('>pq')
-    self.terminalOutputTextBrowser.append("<p style='color: green'>"+response.strip('\r\n')+"</p>")
-    self.warmupActive = False
-    self.updateAllStatusIndicators()
-    self.terminalOutputTextBrowser.append(
-        "<p style='color: blue'>Armed for external trigger (lamp external, QS internal, shutter open, QS armed).</p>")
+  # --- Jobs of several steps (the Arm External / Warmup / STOP buttons, and BLACS's buttons) ---
+  # Each returns None when every step is done, or words naming the step that failed
+  # ("arm failed at step 5 of 6 (shutter open, >r1): the laser did not answer >r1"). A job stops
+  # at the first failed step and sends nothing after it. Every step needs an answer from the
+  # laser; a mode step also needs the mode the laser reports back to be the one asked for.
 
-  def stopLaser(self): #This does the same thing as toggleActiveStatus if active status == 1. But it's redundant for safety, in case gui and laser get de-synced somehow.
-    print(">s")
-    self.terminalOutputTextBrowser.append("<p style='color: black'>"+'>s'+"</p>");
-    response = self._sendCommand(b'>s\n')
-    if response is not None:
-      with self._stateLock: self.activeStatus = 0; self.shutterStatus = 0; self.qSwitchStatus = 0
-      print("response:", response)
-      self.terminalOutputTextBrowser.append("<p style='color: green'>"+response.strip('\r\n')+"</p>");
-    self.warmupActive = False
+  def _runJob(self, job, steps):
+    n = len(steps)
+    for i, (label, step) in enumerate(steps, 1):
+      why = step() if self.serialConnected else "no serial connection to the laser"
+      if why:
+        words = "%s failed at step %d of %d (%s): %s" % (job, i, n, label, why)
+        self.terminalOutputTextBrowser.append("<p style='color: red'>%s</p>" % words)
+        self.updateAllStatusIndicators()
+        return words
     self.updateAllStatusIndicators()
+    return None
+
+  def _commandStep(self, cmd, **state):
+    """One step: send cmd; on an answer set the cached state (e.g. shutterStatus=1)."""
+    response = self._sendCommand((cmd + '\n').encode('ascii'))
+    if response is None:
+      return "the laser did not answer %s" % cmd
+    with self._stateLock:
+      for name, value in state.items(): setattr(self, name, value)
+    self.terminalOutputTextBrowser.append(cmd)
+    self.terminalOutputTextBrowser.append("<p style='color: green'>"+response.strip('\r\n')+"</p>")
+    return None
+
+  def _modeStep(self, set_mode):
+    result = set_mode()
+    return None if result.get("status") == "SUCCESS" else result.get("message", "refused")
+
+  def _standbyStep(self):
+    return self._commandStep('>s', activeStatus=0, shutterStatus=0, qSwitchStatus=0)
+
+  def startLaser(self):
+    """Arm for the external flashlamp trigger. None when armed, else the failed step."""
+    words = self._runJob("arm", [
+        ("standby, >s", self._standbyStep),
+        ("lamp mode external, >lpm1", lambda: self._modeStep(self.setFlashLampExternal)),
+        ("Q-switch mode internal, >qsm0", lambda: self._modeStep(self.setQSwitchInternal)),
+        ("lamps on, >a", lambda: self._commandStep('>a', activeStatus=1)),
+        ("shutter open, >r1", lambda: self._commandStep('>r1', shutterStatus=1)),
+        ("Q-switch on, >pq", lambda: self._commandStep('>pq', qSwitchStatus=1)),
+    ])
+    if words is None:
+      self.warmupActive = False
+      self.terminalOutputTextBrowser.append(
+          "<p style='color: blue'>Armed for external trigger (lamp external, QS internal, shutter open, QS armed).</p>")
+    return words
+
+  def stopLaser(self):
+    """Standby (lamps off, shutter closed, Q-switch off). None when done, else the failed step.
+    Always sent, whatever the GUI thinks the laser is doing (it may be out of step)."""
+    self.warmupActive = False
+    return self._runJob("stop", [("standby, >s", self._standbyStep)])
 
   def toggleTerminalInput(self):
     if self.terminalEnabled:
@@ -769,32 +786,20 @@ class SingleLaserController(QtWidgets.QWidget, Ui_Widget):
       self._setLabelColor(self.temperatureStatusLabel, bg="#90EE90", fg="black")
 
   def startWarmup(self):
-    if not self.serialConnected:
-      self.terminalOutputTextBrowser.append("<p style='color: red'>Cannot warmup: no serial connection</p>")
-      return
-    self.warmupActive = True
-    #Go to standby (always send — clears shutter/qswitch, required for mode switch)
-    response = self._sendCommand(b'>s\n')
-    if response is None: return
-    with self._stateLock: self.activeStatus = 0; self.shutterStatus = 0; self.qSwitchStatus = 0
-    self.terminalOutputTextBrowser.append('>s (standby for warmup)')
-    #Set internal lamp mode (always send — don't trust cache)
-    self.setFlashLampInternal()
-    if not self.serialConnected: return
-    if self.flashLampMode != 0:
+    """Warm-up: lamps firing on the internal trigger, shutter closed, Q-switch off. None when
+    done, else the failed step. startWarmup does not set the voltage."""
+    words = self._runJob("warm_up", [
+        ("standby, >s", self._standbyStep),
+        ("lamp mode internal, >lpm0", lambda: self._modeStep(self.setFlashLampInternal)),
+        ("lamps on, >a", lambda: self._commandStep('>a', activeStatus=1)),
+    ])
+    if words is None:
+      self.warmupActive = True
+      self.updateTemp()
+      self.updateAllStatusIndicators()
       self.terminalOutputTextBrowser.append(
-          "<p style='color: red'>Warmup aborted: lamp mode is %d, not internal (0)</p>" % self.flashLampMode)
-      return
-    #Activate lamps (internal trigger fires immediately)
-    response = self._sendCommand(b'>a\n')
-    if response is None: return
-    with self._stateLock: self.activeStatus = 1
-    self.terminalOutputTextBrowser.append('>a')
-    self.terminalOutputTextBrowser.append("<p style='color: green'>"+response.strip('\r\n')+"</p>")
-    self.updateTemp()
-    self.updateAllStatusIndicators()
-    self.terminalOutputTextBrowser.append(
-        "<p style='color: blue'>Warmup started (internal trigger). Lamps firing, shutter closed.</p>")
+          "<p style='color: blue'>Warmup started (internal trigger). Lamps firing, shutter closed.</p>")
+    return words
 
   def toggleKeepWarm(self, checked):
     """Toggle the auto-warmup-if-cold behaviour.
@@ -845,237 +850,132 @@ class SingleLaserController(QtWidgets.QWidget, Ui_Widget):
     Uses hysteresis to prevent oscillation:
     - Triggers warmup when temp drops below TEMP_COLD (37°C)
     - Resets trigger when temp rises to TEMP_OPERATING (39°C)
-    Matches the BLACS tab's _evaluate_keep_warm hysteresis logic.
+    The one keep-warm rule (BLACS has none; it only ticks this box through the menu link).
+    An armed laser (lamps, shutter, Q-switch on) is left alone: a warm-up would drop it out of
+    its armed state in the middle of a run. It is warmed once it is no longer armed.
     """
     if not self.keepWarmActive:
       return
     if not self.serialConnected:
       return
-    # Defer to BLACS when it's actively controlling (auto-expires after 5 min)
-    if self._blacsConnected and (time.time() - self._lastBlacsContact) < 300:
-      return
     temp = self.lastTemperature
-    if temp < self.TEMP_COLD and not self._warmupTriggered:
-      self._warmupTriggered = True
+    armed = self.activeStatus and self.shutterStatus and self.qSwitchStatus
+    if temp < self.TEMP_COLD and not self._warmupTriggered and not armed:
       self.terminalOutputTextBrowser.append(
           "<p style='color: blue'>Auto-warmup: cold (%.1f°C), entering warmup.</p>" % temp)
-      self.startWarmup()
+      self._warmupTriggered = self.startWarmup() is None    # a failed warm-up is tried again
     elif temp >= self.TEMP_OPERATING:
       if self._warmupTriggered:
         self._warmupTriggered = False
 
-  # --- Thread-safe accessors for ZMQ server ---
+  # --- What BLACS reads and does (HugeSkyController's menu server, bbx_zmq/menus/bigsky.py) ---
+  # The menu server has already checked the name and the range against the Big Sky menu; these
+  # handlers add only what needs the laser's state (shutter before lamps, modes in standby).
 
-  def getVoltage(self):
-    """Return cached flashlamp voltage (int, volts). Thread-safe read."""
-    with self._stateLock: return self.fLampVoltage
+  def remoteSnapshot(self):
+    """Every menu value of this laser, from the GUI's cached state. Thread-safe read (the menu
+    server's thread)."""
+    with self._stateLock:
+      return {"voltage": self.fLampVoltage, "lamps": int(self.activeStatus),
+              "shutter": int(self.shutterStatus), "qswitch": int(self.qSwitchStatus),
+              "lamp_mode": int(self.flashLampMode), "qswitch_mode": int(self.qSwitchMode),
+              "temperature": float(self.lastTemperature), "keep_warm": int(bool(self.keepWarmActive))}
 
-  def getTemperature(self):
-    """Return cached temperature (float, deg C). Thread-safe read."""
-    with self._stateLock: return self.lastTemperature
-
-  def getActiveStatus(self):
-    """Return lamp active status (0 or 1). Thread-safe read."""
-    with self._stateLock: return self.activeStatus
-
-  def getShutterStatus(self):
-    """Return shutter status (0=closed, 1=open). Thread-safe read."""
-    with self._stateLock: return self.shutterStatus
-
-  def getQSwitchStatus(self):
-    """Return Q-switch status (0=disarmed, 1=armed). Thread-safe read."""
-    with self._stateLock: return self.qSwitchStatus
-
-  def getLampMode(self):
-    """Return lamp trigger mode (0=internal, 1=external). Thread-safe read."""
-    with self._stateLock: return self.flashLampMode
-
-  def getQSwitchMode(self):
-    """Return Q-switch mode (0=internal, 1=burst, 2=external). Thread-safe read."""
-    with self._stateLock: return self.qSwitchMode
-
-  def executeRemoteCommand(self, command, value, future=None):
-    """Thread-safe remote command. Emits signal to Qt main thread.
-
-    `future` is a concurrent.futures.Future. The slot writes one of three
-    dict shapes to it:
-      {"status": "SUCCESS"}
-      {"status": "REJECTED", "code": "...", "message": "..."}
-      {"status": "ERROR", "message": "..."}
-    The HugeSkyController ZMQ dispatcher translates these to v2 envelope
-    statuses (SUCCESS / REJECTED / ERROR) per docs/remotecontrol-zmq-protocol-v2.md
-    §1.3. Caller should wait via future.result(timeout=...).
-    """
+  def executeRemoteCommand(self, command, value, future):
+    """Called from the menu server's thread: runs `command` on the Qt main thread (where the
+    serial port and the widgets live). `future` gets the result (what was really set; None for
+    a button), or the exception: RemoteRefused(code, words) when it could not be done."""
     self._remoteCommandRequested.emit(command, value, future)
 
   @pyqtSlot(str, object, object)
   def _handleRemoteCommand(self, command, value, future):
-    """Slot runs on main/GUI thread. Dispatches remote commands and writes
-    one of {SUCCESS, REJECTED, ERROR} dict shapes to `future`. See
-    executeRemoteCommand docstring for the shapes.
-    """
-    result = {"status": "SUCCESS"}
+    if future.done():          # the server stopped waiting (time limit): do not act late
+      return
+    self.terminalOutputTextBrowser.append("<p style='color: blue'>[BLACS] %s %s</p>"
+                                          % (command, "" if value is None else "= %s" % value))
     try:
-      self._blacsConnected = True
-      self._lastBlacsContact = time.time()
-      self.terminalOutputTextBrowser.append("<p style='color: blue'>[ZMQ] %s = %s</p>" % (command, str(value)))
-      if command == 'voltage':
-        result = self._remoteSetVoltage(int(round(float(value))))
-      elif command == 'shutter':
-        result = self._remoteSetShutter(int(round(float(value))))
-      elif command == 'lamps':
-        result = self._remoteSetLamps(int(round(float(value))))
-      elif command == 'qswitch':
-        result = self._remoteSetQSwitch(int(round(float(value))))
-      elif command == 'lamp_mode':
-        result = self._remoteSetLampMode(int(round(float(value))))
-      elif command == 'qswitch_mode':
-        result = self._remoteSetQSwitchMode(int(round(float(value))))
-      elif command == 'warmup':
-        if int(round(float(value))): self.startWarmup()
-        else:
-          self.warmupActive = False
-          self.terminalOutputTextBrowser.append("<p style='color: blue'>[ZMQ] Warmup stopped</p>")
-      elif command == 'start_lasing':
-        self.startLaser()
-      elif command == 'stop':
-        self.stopLaser()
-      elif command == 'keep_warm':
-        checked = bool(int(round(float(value))))
-        if checked != self.keepWarmActive:
-          self.keepWarmCheckBox.setChecked(checked)
-      else:
-        result = {"status": "ERROR", "message": "unknown command: %s" % command}
-        print("Unknown remote command: %s" % command)
-      # Default for handlers that returned None (no rejection path): SUCCESS
-      if result is None:
-        result = {"status": "SUCCESS"}
-    except Exception as e:
-      result = {"status": "ERROR", "message": "GUI exception: %s" % e}
-      print("Exception in _handleRemoteCommand:", e)
-    finally:
-      if future is not None and not future.done():
-        future.set_result(result)
+      result = self._remoteDo(command, value)
+    except Exception as e:     # noqa: BLE001  (RemoteRefused, or a bug: both go to BLACS)
+      if not future.done(): future.set_exception(e)
+      return
+    if not future.done(): future.set_result(result)
+
+  def _remoteDo(self, command, value):
+    jobs = {'arm': self.startLaser, 'warm_up': self.startWarmup, 'stop': self.stopLaser}
+    if command in jobs:
+      words = jobs[command]()
+      if words: raise RemoteRefused("failed_at_step", words)
+      return None
+    sets = {'voltage': self._remoteSetVoltage, 'lamps': self._remoteSetLamps,
+            'shutter': self._remoteSetShutter, 'qswitch': self._remoteSetQSwitch,
+            'lamp_mode': self._remoteSetLampMode, 'qswitch_mode': self._remoteSetQSwitchMode,
+            'keep_warm': self._remoteSetKeepWarm}
+    if command not in sets:
+      raise RemoteRefused("unknown_command", "this GUI has no %r" % command)
+    return sets[command](int(round(float(value))))
+
+  def _remoteCommand(self, cmd, **state):
+    """Send cmd; RemoteRefused when the laser does not answer. Updates the indicators."""
+    why = self._commandStep(cmd, **state)
+    self.updateAllStatusIndicators()
+    if why: raise RemoteRefused("no_answer", why)
 
   def _remoteSetVoltage(self, voltage_V):
-    if voltage_V < 500 or voltage_V > 1400:
-      msg = "rejected: voltage %d out of range [500,1400]" % voltage_V
-      self.terminalOutputTextBrowser.append("<p style='color: orange'>[ZMQ] %s</p>" % msg)
-      return {"status": "REJECTED",
-              "code": "voltage_out_of_range", "message": msg}
-    # Always send — deduplication is handled by BLACS worker (_last_sent_values)
-    toWrite = ">vmo{vol}\n".format(vol=str(0)+str(voltage_V) if voltage_V<1000 else str(voltage_V))
-    response = self._sendCommand(toWrite)
-    if response is not None:
-      try:
-        with self._stateLock: self.fLampVoltage = int(response.strip('\r\nvoltage m V'))
-      except ValueError:
-        self.terminalOutputTextBrowser.append("<p style='color: orange'>Voltage parse error</p>"); return
-      print("remote voltage response:", response)
-      self.terminalOutputTextBrowser.append("<p style='color: green'>"+response.strip('\r\n')+"</p>")
-      self.flashLampVoltageSpinBox.setValue(self.fLampVoltage)
-      self.PowerEstimateValue.setText('%.2f'%np.interp(self.fLampVoltage,self.calibVolts,self.calibPower) + " W")
-      self._energyReadbackPending = True  # deferred to next temp poll
-    # On timeout (None): leave cache unchanged — don't assume command succeeded
-
-  def _remoteSetShutter(self, state):
-    """Set shutter to target state (not a toggle). 1=open, 0=close."""
-    if state and not self.activeStatus:
-      msg = "rejected: lamps not active (cannot open shutter)"
-      self.terminalOutputTextBrowser.append("<p style='color: orange'>[ZMQ] %s</p>" % msg)
-      return {"status": "REJECTED",
-              "code": "lamps_not_active", "message": msg}
-    # Send the specific command for the target state — don't rely on cached state for toggle direction
-    if state:
-      response = self._sendCommand(b'>r1\n')
-      if response is not None:
-        with self._stateLock: self.shutterStatus = 1
-        self.terminalOutputTextBrowser.append("<p style='color: green'>"+response.strip('\r\n')+"</p>")
-    else:
-      response = self._sendCommand(b'>r0\n')
-      if response is not None:
-        with self._stateLock: self.shutterStatus = 0
-        self.terminalOutputTextBrowser.append("<p style='color: green'>"+response.strip('\r\n')+"</p>")
-    self.updateAllStatusIndicators()
+    cmd = ">vmo%04d" % voltage_V
+    response = self._sendCommand((cmd + '\n').encode('ascii'))
+    if response is None:
+      raise RemoteRefused("no_answer", "the laser did not answer %s" % cmd)
+    try:
+      actual = int(response.strip('\r\nvoltage m V'))
+    except ValueError:
+      raise RemoteRefused("bad_answer", "could not read the voltage in the answer to %s: %r" % (cmd, response))
+    with self._stateLock: self.fLampVoltage = actual
+    self.terminalOutputTextBrowser.append("<p style='color: green'>"+response.strip('\r\n')+"</p>")
+    self.flashLampVoltageSpinBox.setValue(actual)
+    self.PowerEstimateValue.setText('%.2f'%np.interp(actual,self.calibVolts,self.calibPower) + " W")
+    self._energyReadbackPending = True  # deferred to next temp poll
+    if actual != voltage_V:
+      raise RemoteRefused("did_not_take_effect", "asked %d V, the laser reports %d V" % (voltage_V, actual))
+    return actual
 
   def _remoteSetLamps(self, state):
-    """Set lamps to target state (not a toggle). 1=activate, 0=standby."""
-    # Send the specific command for the target state
-    if state:
-      response = self._sendCommand(b'>a\n')
-      if response is not None:
-        with self._stateLock: self.activeStatus = 1
-        self.terminalOutputTextBrowser.append("<p style='color: green'>"+response.strip('\r\n')+"</p>")
-    else:
-      response = self._sendCommand(b'>s\n')
-      if response is not None:
-        with self._stateLock: self.activeStatus = 0; self.shutterStatus = 0; self.qSwitchStatus = 0
-        self.terminalOutputTextBrowser.append("<p style='color: green'>"+response.strip('\r\n')+"</p>")
-    self.updateAllStatusIndicators()
+    if state: self._remoteCommand('>a', activeStatus=1)
+    else: self._remoteCommand('>s', activeStatus=0, shutterStatus=0, qSwitchStatus=0)
+    return state
+
+  def _remoteSetShutter(self, state):
+    if state and not self.activeStatus:
+      raise RemoteRefused("lamps_not_active", "the shutter opens only while the lamps fire")
+    self._remoteCommand('>r1' if state else '>r0', shutterStatus=state)
+    return state
 
   def _remoteSetQSwitch(self, state):
-    """Set Q-switch to target state (not a toggle). 1=arm, 0=disarm."""
     if state and (not self.activeStatus or not self.shutterStatus):
-      msg = "rejected: requires lamps active + shutter open"
-      self.terminalOutputTextBrowser.append("<p style='color: orange'>[ZMQ] %s</p>" % msg)
-      return {"status": "REJECTED",
-              "code": "qswitch_requires_lamps_and_shutter", "message": msg}
-    # Send the specific command for the target state
-    if state:
-      if self.dangerMode:
-        response = self._sendCommand(b'>pq\n')
-        if response is not None:
-          with self._stateLock: self.qSwitchStatus = 1
-          self.terminalOutputTextBrowser.append("<p style='color: green'>"+response.strip('\r\n')+"</p>")
-    else:
-      response = self._sendCommand(b'>sq\n')
-      if response is not None:
-        with self._stateLock: self.qSwitchStatus = 0
-        self.terminalOutputTextBrowser.append("<p style='color: green'>"+response.strip('\r\n')+"</p>")
+      raise RemoteRefused("qswitch_requires_lamps_and_shutter",
+                          "the Q-switch arms only with the lamps firing and the shutter open")
+    self._remoteCommand('>pq' if state else '>sq', qSwitchStatus=state)
+    return state
+
+  def _remoteSetMode(self, what, set_mode):
+    if self.activeStatus:
+      raise RemoteRefused("%s_requires_standby" % what, "%s changes only in standby (lamps off)" % what)
+    result = set_mode()
     self.updateAllStatusIndicators()
+    if result.get("status") != "SUCCESS":
+      raise RemoteRefused(result.get("code", "refused"), result.get("message", ""))
 
   def _remoteSetLampMode(self, mode):
-    """Set lamp mode: 0=internal, 1=external. Requires standby.
-
-    Returns a structured v2 result dict: SUCCESS / REJECTED with one of
-    the codes {lamp_mode_requires_standby, invalid_lamp_mode,
-    serial_failure, parse_failure, did_not_take_effect}. Per docs/remotecontrol-zmq-protocol-v2.md
-    §1.3, error.code is a server-defined string (no central enum)."""
-    if self.activeStatus:
-      msg = "rejected: laser active (must be in standby)"
-      self.terminalOutputTextBrowser.append(
-          "<p style='color: orange'>[ZMQ] lamp_mode=%d %s</p>" % (mode, msg))
-      return {"status": "REJECTED",
-              "code": "lamp_mode_requires_standby", "message": msg}
-    if mode == 0: return self.setFlashLampInternal()
-    elif mode == 1: return self.setFlashLampExternal()
-    else:
-      msg = "rejected: invalid lamp_mode %d (expected 0 or 1)" % mode
-      print(msg)
-      return {"status": "REJECTED",
-              "code": "invalid_lamp_mode", "message": msg}
+    self._remoteSetMode("lamp_mode", self.setFlashLampExternal if mode else self.setFlashLampInternal)
+    return mode
 
   def _remoteSetQSwitchMode(self, mode):
-    """Set Q-switch mode: 0=internal, 1=burst, 2=external. Requires standby.
+    self._remoteSetMode("qswitch_mode", lambda: self._setQSwitchMode(mode))
+    return mode
 
-    Returns a structured v2 result dict: SUCCESS / REJECTED with one of
-    the codes {qswitch_mode_requires_standby, invalid_qswitch_mode}.
-    Per docs/remotecontrol-zmq-protocol-v2.md §1.3, error.code is a
-    server-defined string (no central enum)."""
-    if self.activeStatus:
-      msg = "rejected: laser active (must be in standby)"
-      self.terminalOutputTextBrowser.append(
-          "<p style='color: orange'>[ZMQ] qswitch_mode=%d %s</p>" % (mode, msg))
-      return {"status": "REJECTED",
-              "code": "qswitch_mode_requires_standby", "message": msg}
-    if mode == 0: self.setQSwitchInternal()
-    elif mode == 1: self.setQSwitchBurst()
-    elif mode == 2: self.setQSwitchExternal()
-    else:
-      msg = "rejected: invalid qswitch_mode %d (expected 0/1/2)" % mode
-      print(msg)
-      return {"status": "REJECTED",
-              "code": "invalid_qswitch_mode", "message": msg}
+  def _remoteSetKeepWarm(self, on):
+    if bool(on) != self.keepWarmActive:
+      self.keepWarmCheckBox.setChecked(bool(on))     # toggled -> toggleKeepWarm (the GUI's rule)
+    return int(self.keepWarmActive)
 
   def safeExit(self):
     self.tempPollTimer.stop()

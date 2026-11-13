@@ -1,8 +1,12 @@
-"""Shared fixtures + env gates for BigSky canonical-invariant tests.
+"""Shared fixtures + env gates for the BigSky tests.
 
-The B1-B7 invariants test PRODUCTION CODE (real unbound methods of
-`SingleLaserController` / `BigSkyZmqServer`) against duck-typed `self`
-objects -- no Qt event loop, no real serial port, no ZMQ sockets.
+test_serial_gateway.py (B1-B4) tests PRODUCTION CODE (real unbound methods of
+`SingleLaserController`) against duck-typed `self` objects -- no Qt event
+loop, no real serial port, no ZMQ sockets. test_menu_server.py (BBX-189) runs
+the real controller and the real BLACS menu server in memory, on a fake laser.
+
+The GUI loads GuiBigSkyWidget.ui by a relative path, so the session runs in
+this GUI's folder (wherever pytest was started).
 
 Improvements over the rastering test pattern:
 
@@ -26,14 +30,10 @@ import pytest
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _GUI_DIR = os.path.dirname(_HERE)
 sys.path.insert(0, _GUI_DIR)
+os.chdir(_GUI_DIR)
 
 
 # ---------------------------------------------------------------- env gates
-
-# With ZMQ_V2_REQUIRED=1 a missing zmq_v2 is a loud collection error instead
-# of importorskip's silent "N skipped, exit 0".
-if os.environ.get("ZMQ_V2_REQUIRED"):
-    import zmq_v2  # noqa: F401
 
 def _try_import_controller():
     """SingleLaserController needs PyQt5 + the .ui file + pyserial."""
@@ -93,7 +93,6 @@ def make_controller_self():
         s = types.SimpleNamespace(
             serialConnected=connected,
             _consecutiveErrors=consecutive_errors,
-            _blacsConnected=False,
             _stateLock=threading.RLock(),
             activeStatus=1, shutterStatus=1, qSwitchStatus=1,
             flashLampMode=0, qSwitchMode=0,
@@ -114,30 +113,6 @@ def make_controller_self():
             update_fLampVoltage=mock.Mock(), updateFreq=mock.Mock(),
             update_fLampMode=mock.Mock(), update_qSwitchMode=mock.Mock(),
             update_fLampEnergy=mock.Mock(), updateTemp=mock.Mock(),
-        )
-        return s
-    return _factory
-
-
-@pytest.fixture
-def make_zmq_server_self(hsc_module):
-    """Factory: duck-typed `BigSkyZmqServer` self with autospec'd controllers."""
-    def _factory(connected_lasers=("YAG_1",), disconnected_lasers=()):
-        ctrls = {}
-        for name in connected_lasers:
-            c = mock.MagicMock()
-            c.isConnected.return_value = True
-            ctrls[name] = c
-        for name in disconnected_lasers:
-            c = mock.MagicMock()
-            c.isConnected.return_value = False
-            ctrls[name] = c
-        s = types.SimpleNamespace(
-            _lasers=ctrls,
-            _log=mock.Mock(),
-            MONITOR_PARAMS=hsc_module.BigSkyZmqServer.MONITOR_PARAMS,
-            CHECKABLE_PARAMS=hsc_module.BigSkyZmqServer.CHECKABLE_PARAMS,
-            WRITABLE_PARAMS=hsc_module.BigSkyZmqServer.WRITABLE_PARAMS,
         )
         return s
     return _factory

@@ -4,429 +4,140 @@ from PyQt5.QtWidgets import (QMainWindow, QApplication, QPushButton,
  QWidget, QAction, QTabWidget,QVBoxLayout, QGridLayout, QTabBar, QLineEdit, QTextBrowser)
 from PyQt5.QtGui import QIcon, QPixmap
 from PyQt5.QtCore import pyqtSlot, pyqtSignal, QObject
-from BigSkyControllerAmbitious import SingleLaserController
+from BigSkyControllerAmbitious import SingleLaserController, RemoteRefused
 import serial.tools.list_ports
 import ctypes
 import pickle
 import threading
 import concurrent.futures
-import json
 
-try:
-  import zmq
-  ZMQ_AVAILABLE = True
-except ImportError:
-  ZMQ_AVAILABLE = False
-  print("WARNING: zmq not available. ZMQ server will not start.")
-
-# zmq_v2 (RaX RemoteControl protocol v2) comes from the beambox-daq package bbx_zmq.
+# The menu link to BLACS comes from the beambox-daq package bbx_zmq (BBX-189).
 # Install once into this GUI's Python:  python -m pip install -e <beambox-daq> --no-deps
-from bbx_zmq.zmq_v2 import (
-    RemoteControlServerBase, handler, encode_reply,
-    PROTOCOL_VERSION, ZmqRepTransport,
-)
+# (or put <beambox-daq>\src first on PYTHONPATH). The Big Sky menu, the same file BLACS loads:
+# bbx_zmq/menus/bigsky.py (names, ranges, buttons, time limits, port 55540).
+from bbx_zmq import MenuServer, Refused, ZmqRepTransport
+from bbx_zmq.menus.bigsky import MENU
 
 
-# --- Module-level constants ---
-
-# Max wall time we wait for SingleLaserController's main-thread Qt slot
-# (executeRemoteCommand -> _handleRemoteCommand) to complete and write
-# its Future result. Exceeding this returns v2 TIMEOUT to BLACS. 10s
-# accommodates compound sequences (startWarmup, startLaser) which step
-# the laser through multi-byte command sequences with verify-on-readback;
-# simple writes (voltage, shutter) complete in well under a second.
-_REMOTE_CMD_TIMEOUT_S = 10.0
+# --- BLACS link: the menu server and its handlers ---
 
 
-# --- ZMQ Server for BLACS integration ---
+class BigSkyMenuLink:
+  """The handlers of this GUI's menu server, on the lasers this hub has open.
 
-
-class _BigSkyV2Server(RemoteControlServerBase):
-  """v2 protocol dispatcher composed inside BigSkyZmqServer.
-
-  Lives on the same daemon thread as the PUB loop; ``serve_once``
-  blocks up to ``timeout_ms`` on the REP socket, then dispatches via
-  @handler-decorated methods below.
-
-  Holds a back-reference to the outer ``BigSkyZmqServer`` to read
-  ``_lasers`` / ``WRITABLE_PARAMS`` / etc. No state of its own beyond
-  base-class scaffolding.
+  BLACS reads every value in one snapshot, sets one value, or presses one button (arm, warm_up,
+  stop); names are "<laser>_<name>" (YAG_1_voltage). The menu server (bbx_zmq MenuServer)
+  refuses, before these handlers run, a name that is not on the Big Sky menu, a laser that is
+  not open and a value out of range. A set or press then runs on the laser's own Qt thread; this
+  waits for it up to the menu's time limit and answers what really happened, or refuses with
+  the laser's code and words (an arm that stopped at a step: "failed_at_step").
   """
 
-  # Hub-mode: ADVERTISED_CONNECTIONS is dynamic (lasers register/unregister
-  # at runtime), so we override _handle_hello below. The class-attr stays
-  # None to skip the base default.
-  CAPABILITIES = frozenset({"monitors", "heartbeat"})
+  def __init__(self, log=print):
+    self._lasers = {}     # {"YAG_1": SingleLaserController}
+    self._log = log
 
-  def __init__(self, outer, transport):
-    super().__init__("BigSkyLasers", transport)
-    self._outer = outer
+  def addLaser(self, name, controller):
+    self._lasers[name] = controller
 
-  # ---- HELLO override (hub-mode + side-effect signals) ----
-  def _handle_hello(self, request_id):
-    # Side-effect: notify lasers BLACS is connected. Queued signal cross
-    # to the Qt main thread — emit returns immediately, slot fires later.
-    # Emitting BEFORE building the reply lets the slot start running in
-    # parallel with the ZMQ send. Safe per blacs-expert audit 2026-05-23.
-    for ctrl in list(self._outer._lasers.values()):
-      ctrl._blacsHelloReceived.emit()
-    self._outer._log("ZMQ: HELLO received")
-    return encode_reply(
-        status="SUCCESS",
-        request_id=request_id,
-        extra={
-            "protocol_version": PROTOCOL_VERSION,
-            "server": self._server_name,
-            "capabilities": sorted(self.CAPABILITIES),
-            # Per Q1 §10-resolved: hub advertises prefix patterns.
-            "connections": [
-                "%s_*" % name
-                for name in sorted(self._outer._lasers.keys())
-            ],
-        },
-    )
+  def removeLaser(self, name):
+    self._lasers.pop(name, None)
 
-  # ---- PROGRAM_VALUE ----
-  @handler("PROGRAM_VALUE")
-  def _handle_program(self, connection, value, args, request_id):
-    base, param, is_monitor = self._outer._parse_connection(connection)
-    if base is None or base not in self._outer._lasers:
-      return encode_reply(
-          status="UNKNOWN_CONNECTION", request_id=request_id,
-          error={
-              "code": "unknown_connection",
-              "message": "unknown connection '%s'" % connection,
-              "retryable": False,
-          },
-      )
-    ctrl = self._outer._lasers[base]
+  def units(self):
+    return sorted(self._lasers)
+
+  def readAll(self):
+    snap = {}
+    for name, ctrl in list(self._lasers.items()):
+      snap.update({"%s_%s" % (name, k): v for k, v in ctrl.remoteSnapshot().items()})
+    return snap
+
+  def setValue(self, wire_name, value):
+    laser, item = self._split(wire_name)
+    limit_s = MENU.value(wire_name, [laser]).set_s
+    return self._onLaser(laser, item, value, limit_s, "%s = %s" % (wire_name, value))
+
+  def pressButton(self, wire_name):
+    laser, item = self._split(wire_name)
+    return self._onLaser(laser, item, None, MENU.button(wire_name, [laser]).press_s, wire_name)
+
+  def menuServer(self, transport):
+    return MenuServer(MENU, transport, read_all=self.readAll, set_value=self.setValue,
+                      press_button=self.pressButton, units=self.units)
+
+  def _split(self, wire_name):
+    for laser in sorted(self._lasers, key=len, reverse=True):   # YAG_10 before YAG_1
+      if wire_name.startswith(laser + "_"):
+        return laser, wire_name[len(laser) + 1:]
+    raise Refused("not_on_menu", "no open laser for %r" % wire_name)
+
+  def _onLaser(self, laser, command, value, limit_s, what):
+    ctrl = self._lasers.get(laser)
+    if ctrl is None:
+      raise Refused("not_on_menu", "%s is not open in this GUI" % laser)
     if not ctrl.isConnected():
-      return encode_reply(
-          status="ERROR", request_id=request_id,
-          error={
-              "code": "laser_disconnected",
-              "message": "laser disconnected",
-              "retryable": True,
-          },
-      )
-    if is_monitor:
-      return encode_reply(
-          status="ERROR", request_id=request_id,
-          error={
-              "code": "cannot_program_monitor",
-              "message": "cannot program monitor '%s'" % connection,
-              "retryable": False,
-          },
-      )
-    if param is None or param not in self._outer.WRITABLE_PARAMS:
-      return encode_reply(
-          status="ERROR", request_id=request_id,
-          error={
-              "code": "unknown_writable_param",
-              "message": ("unknown writable param '%s' in '%s'"
-                          % (param, connection)),
-              "retryable": False,
-          },
-      )
-
-    self._outer._log("ZMQ: PROGRAM_VALUE %s = %s" % (connection, value))
-
-    # Dispatch to controller's Qt main thread via Future round-trip.
+      raise Refused("laser_disconnected", "%s: the laser's serial link is down" % laser)
+    self._log("BLACS: %s" % what)
     future = concurrent.futures.Future()
-    ctrl.executeRemoteCommand(param, value, future)
+    ctrl.executeRemoteCommand(command, value, future)
     try:
-      result = future.result(timeout=_REMOTE_CMD_TIMEOUT_S)
+      result = future.result(timeout=limit_s)
     except concurrent.futures.TimeoutError:
-      return encode_reply(
-          status="TIMEOUT", request_id=request_id,
-          error={
-              "code": "command_timeout",
-              "message": "timeout waiting for command to complete",
-              "retryable": True,
-          },
-      )
-
-    # Translate the controller result dict to v2 envelope:
-    #  - {"status": "SUCCESS"}                          -> SUCCESS
-    #  - {"status": "REJECTED", "code": "...", "message": "..."}
-    #                                                   -> REJECTED w/ code
-    #    (preferred path — controllers in laser_commands.py + remote_bridge.py
-    #     return this structured shape as of item 2B 2026-05-24)
-    #  - {"status": "ERROR", "message": "rejected: ..."} -> REJECTED safety net
-    #    (legacy v1 prefix-sniff; kept as a one-cycle safety net per T6.2
-    #     audit. Remove only after grep confirms zero "rejected:" string
-    #     constructions remain in the mixins.)
-    #  - {"status": "ERROR", "message": <other>}        -> ERROR
-    rstat = result.get("status", "ERROR")
-    rmsg = result.get("message", "")
-    if rstat == "SUCCESS":
-      return encode_reply(status="SUCCESS", request_id=request_id,
-                          value=result.get("value"))
-    if rstat == "REJECTED":
-      return encode_reply(
-          status="REJECTED", request_id=request_id,
-          error={
-              "code": result.get("code", "rejected_unknown"),
-              "message": rmsg,
-              "retryable": False,
-          },
-      )
-    if rstat == "ERROR" and rmsg.lower().startswith("rejected"):
-      # SAFETY NET (legacy v1 string-sniff). Should be unreachable after
-      # 2B since all 10 mixin sites now emit structured REJECTED. Leaving
-      # in place for one cycle so a missed mixin site degrades gracefully
-      # instead of surfacing as a generic ERROR.
-      return encode_reply(
-          status="REJECTED", request_id=request_id,
-          error={
-              "code": "rejected_did_not_take_effect",
-              "message": rmsg,
-              "retryable": False,
-          },
-      )
-    return encode_reply(
-        status="ERROR", request_id=request_id,
-        error={
-            "code": "command_error",
-            "message": rmsg or "unknown error",
-            "retryable": False,
-        },
-    )
-
-  # ---- CHECK_VALUE ----
-  @handler("CHECK_VALUE")
-  def _handle_check(self, connection, value, args, request_id):
-    base, param, _is_monitor = self._outer._parse_connection(connection)
-    if base is None or base not in self._outer._lasers:
-      return encode_reply(
-          status="UNKNOWN_CONNECTION", request_id=request_id,
-          error={
-              "code": "unknown_connection",
-              "message": "unknown connection '%s'" % connection,
-              "retryable": False,
-          },
-      )
-    ctrl = self._outer._lasers[base]
-    if not ctrl.isConnected():
-      return encode_reply(
-          status="ERROR", request_id=request_id,
-          error={
-              "code": "laser_disconnected",
-              "message": "laser disconnected",
-              "retryable": True,
-          },
-      )
-    check_param = param if param else 'voltage'
-    if check_param not in self._outer.CHECKABLE_PARAMS:
-      return encode_reply(
-          status="ERROR", request_id=request_id,
-          error={
-              "code": "unknown_monitor_param",
-              "message": ("unknown monitor param '%s' in '%s'"
-                          % (check_param, connection)),
-              "retryable": False,
-          },
-      )
-    try:
-      val, fmt = self._outer._get_monitor_value(ctrl, check_param)
-    except Exception:
-      return encode_reply(
-          status="ERROR", request_id=request_id,
-          error={
-              "code": "laser_disconnected",
-              "message": "laser disconnected",
-              "retryable": True,
-          },
-      )
-    if val is None:
-      return encode_reply(
-          status="ERROR", request_id=request_id,
-          error={
-              "code": "unknown_monitor_param",
-              "message": ("unknown monitor param '%s' in '%s'"
-                          % (check_param, connection)),
-              "retryable": False,
-          },
-      )
-    self._outer._log("ZMQ: CHECK_VALUE %s -> %s" % (connection, fmt % val))
-    return encode_reply(status="SUCCESS", request_id=request_id, value=val)
+      future.cancel()      # not started yet: it never runs
+      raise Refused("gui_busy", "%s: not finished within %.0f s (if it had started, it may still "
+                                "finish; look at the GUI)" % (what, limit_s)) from None
+    except RemoteRefused as e:
+      self._log("BLACS: %s refused: [%s] %s" % (what, e.code, e.words))
+      raise Refused(e.code, e.words) from None
+    return result
 
 
-class BigSkyZmqServer(QObject):
-  """ZMQ REP+PUB server for BLACS remote control of BigSky YAG lasers.
-
-  Runs a daemon thread with:
-    - REP socket: handles HELLO, PROGRAM_VALUE, CHECK_VALUE from BLACS
-    - PUB socket: broadcasts heartbeat (~1 Hz) and all monitors (~4 Hz)
-
-  Connection name format (per laser, e.g. YAG_1):
-    Writable:  YAG_1_voltage, YAG_1_shutter, YAG_1_lamps, YAG_1_qswitch,
-               YAG_1_lamp_mode, YAG_1_qswitch_mode, YAG_1_warmup,
-               YAG_1_start_lasing, YAG_1_stop
-    Monitors:  YAG_1_temperature_monitor, YAG_1_voltage_monitor,
-               YAG_1_lamps_monitor, YAG_1_shutter_monitor, YAG_1_qswitch_monitor
-  """
+class BigSkyMenuServer(QObject):
+  """The menu server on its own thread, on the menu's port (REP, tcp://*:55540)."""
   logMessage = pyqtSignal(str)
 
-  DEFAULT_REP_PORT = 55540
-  DEFAULT_PUB_PORT = 55541
-
-  # Valid parameter names for PROGRAM_VALUE commands
-  WRITABLE_PARAMS = {'voltage', 'shutter', 'lamps', 'qswitch', 'lamp_mode',
-                     'qswitch_mode', 'warmup', 'start_lasing', 'stop',
-                     'keep_warm'}
-  # Parameter names for CHECK_VALUE / PUB-SUB monitors
-  MONITOR_PARAMS = {'temperature', 'voltage', 'lamps', 'shutter', 'qswitch'}
-  # Superset: params that CHECK_VALUE can read back (monitors + readable writable state)
-  CHECKABLE_PARAMS = MONITOR_PARAMS | {'lamp_mode', 'qswitch_mode'}
-
-  def __init__(self, rep_port=None, pub_port=None, parent=None):
+  def __init__(self, parent=None):
     super().__init__(parent)
-    self.rep_port = rep_port or self.DEFAULT_REP_PORT
-    self.pub_port = pub_port or self.DEFAULT_PUB_PORT
+    self.link = BigSkyMenuLink(log=self._log)
     self._stop_event = threading.Event()
     self._thread = None
-    self._lasers = {}  # {connection_name: SingleLaserController} e.g. {"YAG_1": ctrl}
-
-  def registerLaser(self, connection_name, controller):
-    """Register a SingleLaserController under a BLACS connection name (e.g. 'YAG_1')."""
-    self._lasers[connection_name] = controller
-    self._log("ZMQ: registered laser '%s' (SN %s)" % (connection_name, controller.serialNumber))
-
-  def unregisterLaser(self, connection_name):
-    """Remove a laser from the ZMQ routing table."""
-    if connection_name in self._lasers:
-      del self._lasers[connection_name]
-      self._log("ZMQ: unregistered laser '%s'" % connection_name)
 
   def start(self):
-    """Start the ZMQ server daemon thread."""
-    if not ZMQ_AVAILABLE:
-      self._log("ZMQ: zmq module not available. Server not started."); return
     if self._thread is not None and self._thread.is_alive():
-      self._log("ZMQ: server already running."); return
+      self._log("BLACS link: already running."); return
     self._stop_event.clear()
-    self._thread = threading.Thread(target=self._server_loop, daemon=True, name="BigSkyZmqServer")
+    self._thread = threading.Thread(target=self._serverLoop, daemon=True, name="BigSkyMenuServer")
     self._thread.start()
-    self._log("ZMQ: server started (REP port %d, PUB port %d)" % (self.rep_port, self.pub_port))
 
   def stop(self):
-    """Signal the server thread to stop and wait for it to finish."""
     self._stop_event.set()
     if self._thread is not None:
       self._thread.join(timeout=3.0)
       self._thread = None
-    self._log("ZMQ: server stopped.")
+    self._log("BLACS link: stopped.")
 
   def _log(self, msg):
     print(msg)
     self.logMessage.emit(msg)
 
-  def _parse_connection(self, connection):
-    """Parse a connection name into (base_name, param, is_monitor).
-    Examples:
-      'YAG_1_voltage'              -> ('YAG_1', 'voltage', False)
-      'YAG_1_temperature_monitor'  -> ('YAG_1', 'temperature', True)
-      'YAG_1_start_lasing'         -> ('YAG_1', 'start_lasing', False)
-      'YAG_1_qswitch_mode'         -> ('YAG_1', 'qswitch_mode', False)
-    Returns (None, None, False) if the laser base name is not registered."""
-    is_monitor = connection.endswith('_monitor')
-    stripped = connection[:-len('_monitor')] if is_monitor else connection
-    # Match against registered laser names (longest first to handle e.g. YAG_10 vs YAG_1)
-    for base in sorted(self._lasers.keys(), key=len, reverse=True):
-      if stripped.startswith(base + '_'):
-        param = stripped[len(base)+1:]
-        return (base, param, is_monitor)
-    return (None, None, False)
-
-  def _get_monitor_value(self, ctrl, param):
-    """Read a monitor value from a controller. Returns (value, fmt_str) or (None, error_str)."""
-    if param == 'temperature': return (ctrl.getTemperature(), "%.1f")
-    if param == 'voltage': return (ctrl.getVoltage(), "%d")
-    if param == 'lamps': return (ctrl.getActiveStatus(), "%d")
-    if param == 'shutter': return (ctrl.getShutterStatus(), "%d")
-    if param == 'qswitch': return (ctrl.getQSwitchStatus(), "%d")
-    if param == 'lamp_mode': return (ctrl.getLampMode(), "%d")
-    if param == 'qswitch_mode': return (ctrl.getQSwitchMode(), "%d")
-    return (None, "unknown monitor param '%s'" % param)
-
-  def _server_loop(self):
-    """Main ZMQ server loop running on the daemon thread.
-
-    PUB-SUB (per-laser monitors + heartbeat) is handled inline against a
-    raw zmq.PUB socket. REQ-REP is delegated to ``_BigSkyV2Server``,
-    which wraps a ``ZmqRepTransport`` and uses ``serve_once`` to
-    block-with-timeout, parse, dispatch via @handler methods, and reply.
-    """
-    ctx = zmq.Context.instance()
-
-    transport = ZmqRepTransport("tcp://*:%d" % self.rep_port,
-                                recv_timeout_ms=250)
-    self._v2 = _BigSkyV2Server(self, transport)
-
-    pub_sock = ctx.socket(zmq.PUB)
-    pub_sock.bind("tcp://*:%d" % self.pub_port)
-
-    pub_counter = 0
-
-    def publish(topic, value=""):
-      msg = "%s %s" % (topic, value) if value else topic
-      pub_sock.send_string(msg)
-
-    self._log("ZMQ: server loop running (v2 protocol).")
-
-    # Transport-failure circuit breaker (review I2 2026-05-23). The base
-    # class catches handler exceptions and returns ERROR replies, so any
-    # exception escaping serve_once is transport-level. We tolerate a few
-    # in a row (PUB-side recovers on next iter, REP-side context bounces)
-    # but break the loop after MAX_CONSECUTIVE to avoid hot-spinning when
-    # the socket is truly dead. v1 also `break`d on any non-Again socket
-    # error -- we restore that safety net with a small tolerance window.
-    MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
-    consecutive_failures = 0
-
+  def _serverLoop(self):
+    try:
+      transport = ZmqRepTransport("tcp://*:%d" % MENU.port, recv_timeout_ms=250)
+    except Exception as e:     # noqa: BLE001  (port taken, no pyzmq): the GUI runs without BLACS
+      self._log("BLACS link: not started, port %d: %s" % (MENU.port, e)); return
+    server = self.link.menuServer(transport)
+    self._log("BLACS link: menu %s v%d on port %d." % (MENU.name, MENU.version, MENU.port))
+    failures = 0
     while not self._stop_event.is_set():
-      # --- PUB-SUB broadcasting ---
-      pub_counter += 1
-
-      # All monitors at ~4 Hz (every cycle, since loop is ~250ms)
-      for conn_name, ctrl in list(self._lasers.items()):
-        if not ctrl.isConnected():
-          continue  # don't broadcast stale values for disconnected lasers
-        for param in self.MONITOR_PARAMS:
-          try:
-            val, fmt = self._get_monitor_value(ctrl, param)
-            if val is not None:
-              publish("%s_%s_monitor" % (conn_name, param), fmt % val)
-          except Exception as e:
-            # Controller may be mid-destruction during tab close
-            self._log("ZMQ: PUB error for %s_%s: %s" % (conn_name, param, e))
-            break  # Skip remaining params for this laser
-
-      # Heartbeat at ~1 Hz (every 4th cycle at 250ms = 1s)
-      if pub_counter % 4 == 0:
-        publish("heartbeat")
-
-      # --- REQ-REP via v2 base class. serve_once blocks up to 250ms
-      # on REP; returns False on timeout, True on a dispatched message.
       try:
-        self._v2.serve_once(timeout_ms=250)
-        consecutive_failures = 0
-      except Exception as e:
-        consecutive_failures += 1
-        self._log("ZMQ: dispatch error (%d/%d): %s"
-                  % (consecutive_failures,
-                     MAX_CONSECUTIVE_TRANSPORT_FAILURES, str(e)))
-        if consecutive_failures >= MAX_CONSECUTIVE_TRANSPORT_FAILURES:
-          self._log("ZMQ: too many consecutive transport failures; "
-                    "stopping server loop.")
-          break
-
-    # Cleanup
+        server.serve_once(timeout_ms=250)
+        failures = 0
+      except Exception as e:   # noqa: BLE001  (handler errors are answered; this is the socket)
+        failures += 1
+        self._log("BLACS link: socket error (%d/5): %s" % (failures, e))
+        if failures >= 5:
+          self._log("BLACS link: too many socket errors; stopped."); break
     transport.close()
-    pub_sock.close()
-    self._v2 = None  # release back-ref (review M2 2026-05-23)
-    self._log("ZMQ: server loop exited.")
 
 
 # --- Connection Name Mapping ---
@@ -446,35 +157,38 @@ LASER_SN_TO_CONNECTION = {
 
 
 class BigSkyHub(QMainWindow):
-  def __init__(self):
+  def __init__(self, noLaser=False):
+    """noLaser: the no-laser mode (`--no-laser`): no COM port is scanned or opened; one dummy
+    laser, YAG_1, is open (no serial port), so BLACS can connect, read and press (every press
+    fails at step 1: no serial connection)."""
     super().__init__()
-    self.setWindowTitle('Big Sky Controller Hub')
+    self.setWindowTitle('Big Sky Controller Hub' + (' (no laser)' if noLaser else ''))
     self.setWindowIcon(QIcon('BigSkyDesktopIcon.ico'))
     self.left = 0; self.width = 900
     self.top = 0 ; self.height = 800
     self.setGeometry(self.left, self.top, self.width, self.height)
-    self.table_widget = MyTableWidget(self)
-    self.setCentralWidget(self.table_widget)
 
-    # ZMQ server
-    self.zmqServer = BigSkyZmqServer(parent=self)
+    # BLACS link (the menu server); lasers are added to it as their tabs open
+    self.zmqServer = BigSkyMenuServer(parent=self)
     self.zmqServer.logMessage.connect(self._onZmqLog)
+    self.table_widget = MyTableWidget(self, noLaser=noLaser)
+    self.setCentralWidget(self.table_widget)
     self.zmqServer.start()
 
     self.show()
 
   def _onZmqLog(self, msg):
-    """Append ZMQ log messages to the home tab's text browser."""
+    """Append BLACS link messages to the home tab's text browser."""
     self.table_widget.homeTab.text.append("<p style='color: purple'>%s</p>" % msg)
 
   def closeEvent(self, event):
-    """Override close to shut down ZMQ server before exiting."""
+    """Override close to shut down the BLACS link before exiting."""
     self.zmqServer.stop()
     self.table_widget.safeExit()
     event.accept()
 
 class HomeTab(QWidget):
-  def __init__(self,parent):
+  def __init__(self,parent,scan=True):
     super().__init__()
     try:
         with open('laserNames.pkl','rb') as file: self.laserNames=pickle.load(file); file.close()
@@ -487,8 +201,9 @@ class HomeTab(QWidget):
     self.processes={}
     self._parentWidget = parent  # store ref for connecting new buttons
 
-    # Initial scan
-    self._scanPorts()
+    # Initial scan (it opens every COM port and writes >sn: not in the no-laser mode)
+    if scan:
+      self._scanPorts()
 
     # Bottom row: text browser, refresh button, save button
     bottomRow = len(self.buttons)
@@ -498,6 +213,7 @@ class HomeTab(QWidget):
     self.refreshButton = QPushButton('Refresh Connections')
     self.refreshButton.setStyleSheet("background-color: #E3F2FD; font-weight: bold;")
     self.refreshButton.pressed.connect(self.refreshConnections)
+    self.refreshButton.setEnabled(scan)     # the refresh scans (opens) the COM ports
     btnLayout.addWidget(self.refreshButton)
     self.saveButton = QPushButton('Save Labels')
     self.saveButton.pressed.connect(self.saveLabels)
@@ -573,14 +289,14 @@ class HomeTab(QWidget):
     self.text.append('laser names saved to file.')
 
 class MyTableWidget(QWidget):
-  def __init__(self, parent):
+  def __init__(self, parent, noLaser=False):
     super(QWidget, self).__init__(parent)
     self.parent = parent
     self.layout = QVBoxLayout(self)
     # Initialize tab screen
     self.tabs = QTabWidget()
     #self.tabs.resize(width,height)
-    self.homeTab=HomeTab(self)
+    self.homeTab=HomeTab(self, scan=not noLaser)
     print("test: ", len(self.homeTab.buttons))
 
     # Track how many lasers have been launched (for fallback tab-order connection naming)
@@ -595,6 +311,10 @@ class MyTableWidget(QWidget):
     self.tabs.tabBar().setTabButton(0, QTabBar.RightSide, None) #removes close button from homeTab
     # Add tabs to widget
     self.layout.addWidget(self.tabs)
+    if noLaser:   # one dummy laser (cPort=-1: SingleLaserController opens no serial port)
+      ctrl = SingleLaserController(cPort=-1, lString="YAG_1 (no laser)")
+      self.tabs.addTab(ctrl, "YAG_1 (no laser)")
+      self._registerLaser("YAG_1", ctrl, "YAG_1 (no laser)")
 
   def _assignConnectionName(self, serialNumber):
     """Determine the BLACS connection name for a laser.
@@ -614,13 +334,15 @@ class MyTableWidget(QWidget):
     self.tabs.addTab(ctrl, labelString)
     self.homeTab.buttons[i].setEnabled(False)
 
-    # Register with ZMQ server
     sn = self.homeTab.serialNumbers[i] if i < len(self.homeTab.serialNumbers) else str(i)
-    connName = self._assignConnectionName(sn)
+    self._registerLaser(self._assignConnectionName(sn), ctrl, labelString)
+
+  def _registerLaser(self, connName, ctrl, labelString):
+    """Open the laser to BLACS under connName (YAG_1, ...)."""
     ctrl._zmqConnectionName = connName  # stash on controller for unregister lookup
     ctrl._tabLabel = labelString  # store original label for disconnect/reconnect styling
-    self.parent.zmqServer.registerLaser(connName, ctrl)
-    self.homeTab.text.append("ZMQ: laser registered as '%s'" % connName)
+    self.parent.zmqServer.link.addLaser(connName, ctrl)
+    self.homeTab.text.append("BLACS link: laser open as '%s'" % connName)
 
     # Connect disconnect/reconnect signal to tab styling
     ctrl.connectionStatusChanged.connect(
@@ -649,10 +371,10 @@ class MyTableWidget(QWidget):
     label = widget.labelString
     self.homeTab.text.append("Closing tab %d aka %s"%(i,label))
 
-    # Unregister from ZMQ server
+    # Close it to BLACS
     connName = getattr(widget, '_zmqConnectionName', None)
     if connName:
-      self.parent.zmqServer.unregisterLaser(connName)
+      self.parent.zmqServer.link.removeLaser(connName)
 
     widget.safeExit()
     self.tabs.removeTab(i)
@@ -668,6 +390,6 @@ class MyTableWidget(QWidget):
 if __name__ == '__main__':
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(u'BigSkyControllerHub')
     app = QApplication(sys.argv)
-    window = BigSkyHub()
+    window = BigSkyHub(noLaser='--no-laser' in sys.argv[1:])
     app.aboutToQuit.connect(lambda: (window.zmqServer.stop(), window.table_widget.safeExit()))
     sys.exit(app.exec_())
