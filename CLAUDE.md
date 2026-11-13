@@ -2,24 +2,29 @@
 
 ## Environment
 
-- **Python**: `/c/Users/radmo/miniconda/envs/guis/python.exe` (conda env `guis`)
-- **Platform**: Windows 11, bash shell in Claude Code (use forward slashes, Unix syntax)
+- **Python on the BeamBox lab PC (MITBeamBox)**: the system Python, `py -3.13` (PyQt5, pyzmq,
+  pyserial, pytest installed). Its `bbx_zmq` is an editable install of the beambox-daq repo's
+  `src`. To run against another checkout (a worktree), put that `src` first: `PYTHONPATH=<checkout>\src`.
+- (Upstream RaX PC: conda env `guis`, `/c/Users/radmo/miniconda/envs/guis/python.exe`.)
 - **Framework**: PyQt5 with Qt Designer `.ui` files loaded via `uic.loadUiType`
 
 ## How to Run
 
 ```bash
-# Activate environment first
-conda activate guis
+# Multi-laser hub (production use): scans the COM ports (opens each one and writes >sn)
+py -3.13 HugeSkyController.pyw
 
-# Single-laser standalone (for development/testing)
-python BigSkyControllerAmbitious.py
+# No-laser mode: no COM port is scanned or opened; one dummy laser YAG_1 is open to BLACS
+py -3.13 HugeSkyController.pyw --no-laser
 
-# Multi-laser hub (production use)
-python HugeSkyController.pyw
+# Single-laser standalone (no BLACS link)
+py -3.13 BigSkyControllerAmbitious.py
+
+# Tests (no serial port, no socket; runs from any folder)
+PYTHONPATH=<beambox-daq>\src QT_QPA_PLATFORM=offscreen py -3.13 -m pytest -q tests
 ```
 
-Without a laser connected, the GUI runs in dummy mode with no serial port.
+Without a laser connected, a laser tab runs in dummy mode with no serial port.
 
 ## Project Structure
 
@@ -97,69 +102,48 @@ Mode changes (Q-switch mode, lamp mode) require the laser to be in standby first
 
 ## Testing Notes
 
-- The GUI can run without a laser connected (dummy mode) for UI testing
-- The `dangerMode` flag is set to `True` on connection and gates Q-switch/single-pulse operations
-- `QTimer` is used for temperature polling during warmup (60-second interval)
+- The GUI can run without a laser connected (dummy mode, or `--no-laser` for the hub) for UI testing
+- The `dangerMode` flag is set to `True` on connection and gates the manual Q-switch/single-pulse buttons
+- `QTimer` polls the temperature every 60 s while the serial link is up (also drives keep-warm)
+- `tests/test_menu_server.py`: the real BLACS client against the real menu server and laser
+  controller, in memory, with a `FakeLaser` on the serial line. `tests/test_serial_gateway.py`:
+  `_sendCommand` / disconnect / reconnect on duck-typed objects.
 
-## BLACS Integration
+## BLACS Integration (menu link, BBX-189, 2026-11-12)
 
-This program is integrated into the BLACS experiment control system (labscript-suite at `C:\Users\radmo\labscript-suite`).
+BLACS (beambox-daq, device `bbx_devices/BigSkyHub`) talks to this GUI through one shared
+**menu**: `bbx_zmq/menus/bigsky.py` in the beambox-daq repo. BLACS and this GUI load the same
+file: the names, ranges, buttons, time limits and the port (REP **55540**; no PUB stream, no
+heartbeat). Wire format: the v2 request/reply envelope of `bbx_zmq.zmq_v2`; actions HELLO,
+SNAPSHOT, SET, PRESS.
 
-**Protocol** (2026-05-23): the REQ-REP side speaks the **v2 RemoteControl
-protocol**. The server is composition-based: `BigSkyZmqServer(QObject)`
-owns the daemon thread + raw `zmq.PUB` socket; an inner
-`_BigSkyV2Server(RemoteControlServerBase)` (imported from parent's
-`userlib/external_gui_lib/zmq_v2.py`) dispatches REQ-REP via
-`@handler`-decorated methods (HELLO/PROGRAM_VALUE/CHECK_VALUE) and
-returns v2 envelopes with `id` echo, `status` enum, structured
-`error.{code,message,retryable}`, and dynamic `connections` advertisement
-in the HELLO reply (Q1 hub-mode). PyQt5 signal emit on HELLO
-(`_blacsHelloReceived`) happens before reply build per blacs-expert
-audit. See parent docs:
-[`docs/remotecontrol-zmq-protocol-v2.md`](../../docs/remotecontrol-zmq-protocol-v2.md).
+- `HugeSkyController.pyw`: `BigSkyMenuServer` (thread, port) and `BigSkyMenuLink` (the handlers).
+  The menu server (`bbx_zmq.MenuServer`) refuses a name not on the menu, a laser that is not
+  open and a value out of range **before** any GUI code runs. This GUI is the one guard for the
+  laser. A set or press then runs on the laser tab's Qt thread (`executeRemoteCommand` ->
+  `_handleRemoteCommand`), and the answer says what really happened.
+- Names per laser, `<laser>_<name>` (`YAG_1_voltage`); a laser is open to BLACS as YAG_1, YAG_2
+  (`LASER_SN_TO_CONNECTION`, else tab order). Hello answers the menu name/version and the open lasers.
+- Values (all in every snapshot; set = BLACS may set it): `voltage` [V] 500-1400 set, `lamps`,
+  `shutter`, `qswitch`, `lamp_mode` (0 int, 1 ext), `qswitch_mode` (0 int, 1 burst, 2 ext) set,
+  `temperature` [degC] read only, `keep_warm` set. The GUI refuses: shutter open with lamps
+  off, Q-switch on without lamps + shutter, a mode change unless standby, a laser whose serial
+  link is down; a set the laser does not answer or reads back differently is refused too.
+- Buttons: `arm`, `warm_up`, `stop` = `startLaser`, `startWarmup`, `stopLaser`. Each runs its
+  steps in order and stops at the first one that fails; the answer is "done" or a refusal
+  `failed_at_step` with words like "arm failed at step 5 of 6 (shutter open, >r1): the laser did
+  not answer >r1". Arm: standby, lamp mode external, **Q-switch mode internal**, lamps, shutter,
+  Q-switch. Warm-up: standby, lamp mode internal, lamps. Stop: standby. A mode step needs the
+  mode the laser reports back to match.
+- **Keep warm lives here only** (BLACS just ticks `keep_warm`): below 37 degC a warm-up, then
+  not again until 39 degC; an armed laser (lamps, shutter, Q-switch on) is left alone.
+- **Auto Arm Ext lives in BLACS** (a tick box per laser in the Big Sky tab): it presses `arm`
+  before a shot (unless the snapshot shows the laser armed already) and checks lamps, shutter and
+  Q-switch in the next snapshot; it presses `warm_up` at queue end and on abort.
+- Changing a name, range or button: change the menu file and its `version` (BLACS refuses to run
+  shots when the versions differ).
 
-The historical v1 contract at
-[`userlib/user_devices/BLACS_COMMUNICATION_CONTRACT.md`](../../userlib/user_devices/BLACS_COMMUNICATION_CONTRACT.md)
-is DEPRECATED; v2 servers refuse v1 envelopes per Q4 hard sunset.
-
-- **BLACS device code**: `C:\Users\radmo\labscript-suite\userlib\user_devices\BigSkyHub\`
-- **Connection table**: `C:\Users\radmo\labscript-suite\userlib\labscriptlib\Main_Experiment\connection_table.py`
-
-**ZMQ ports**: REP on 55540, PUB on 55541 (configurable in `BigSkyZmqServer` constructor).
-
-**Shared connection names** (per laser, e.g. `YAG_1`; must match both this server and the BLACS device):
-
-| Writable (PROGRAM_VALUE) | Value | Description |
-|--------------------------|-------|-------------|
-| `YAG_1_voltage` | 500-1400 (V) | Set flashlamp voltage |
-| `YAG_1_shutter` | 0/1 | Close/open shutter |
-| `YAG_1_lamps` | 0/1 | Standby/activate lamps |
-| `YAG_1_qswitch` | 0/1 | Disarm/arm Q-switch |
-| `YAG_1_lamp_mode` | 0/1 | Internal/external lamp trigger |
-| `YAG_1_qswitch_mode` | 0/1/2 | Internal/burst/external Q-switch |
-| `YAG_1_warmup` | 0/1 | Stop/start warmup |
-| `YAG_1_start_lasing` | any | Full start sequence (a→r1→pq) |
-| `YAG_1_stop` | any | Full stop (standby) |
-| `YAG_1_keep_warm` | 0/1 | Enable/disable Auto Keep Warm (synced from BLACS) |
-
-| Checkable (CHECK_VALUE only, no PUB) | Value | Description |
-|---------------------------------------|-------|-------------|
-| `YAG_1_lamp_mode` | 0/1 | Internal/external lamp trigger (read back via CHECK_VALUE) |
-| `YAG_1_qswitch_mode` | 0/1/2 | Internal/burst/external Q-switch (read back via CHECK_VALUE) |
-
-| Monitor (CHECK_VALUE + PUB) | Value | Description |
-|-----------------------------|-------|-------------|
-| `YAG_1_temperature_monitor` | float (C) | Coolant temperature |
-| `YAG_1_voltage_monitor` | int (V) | Current voltage |
-| `YAG_1_lamps_monitor` | 0/1 | Lamp status |
-| `YAG_1_shutter_monitor` | 0/1 | Shutter status |
-| `YAG_1_qswitch_monitor` | 0/1 | Q-switch status |
-
-Same pattern for `YAG_2_*`. Typical triggered mode: Q-switch internal (0) + flashlamp external (1).
-
-**Auto Arm Ext (a.k.a. Auto Re-Arm) is BLACS-side only — no GUI code implements it.** The checkbox is created in `BigSkyTab` (`userlib/user_devices/BigSkyHub/blacs_tabs.py:361`, widget label `"Auto Arm Ext"`); arming runs in `BigSkyWorker._auto_arm_if_needed` (`blacs_workers.py:466`) from both branches of `transition_to_buffered`, idempotent via `_is_armed` plus a CHECK_VALUE cross-check of `lamp_mode/lamps/shutter/qswitch/qswitch_mode`. It has no dedicated connection name — it re-sends the writable connections above, so renaming those breaks auto-arm silently. **Name trap:** the tab has two `keep_warm`-named checkboxes: `_keep_warm`/`_on_keep_warm_toggle` = Auto Arm Ext (never crosses ZMQ); `_keep_warm_temp`/`_on_keep_warm_temp_toggle` = Auto Keep Warm, which is what the `YAG_1_keep_warm` connection carries (`blacs_workers.py:222`). Check which one you have before editing.
-
-**Remote command GUI sync convention:** Every function that changes hardware state (e.g., `setFlashLampExternal`, `toggleShutterStatus`) must also update the corresponding GUI widget (radio button, checkbox, label). When called by user click, the widget is already correct. But when called via ZMQ remote command (`_handleRemoteCommand` dispatch), the widget won't update unless the function explicitly sets it. This also applies to disconnect/reconnect transitions — `_handleDisconnect()` and `_handleReconnect()` must update all GUI elements since no user click triggers the change. Failure to sync causes the GUI to show stale state.
+**Remote command GUI sync convention:** Every function that changes hardware state (e.g., `setFlashLampExternal`, `toggleShutterStatus`) must also update the corresponding GUI widget (radio button, checkbox, label). When called by user click, the widget is already correct. But when called via ZMQ remote command (`_handleRemoteCommand` -> `_remoteDo`), the widget won't update unless the function explicitly sets it. This also applies to disconnect/reconnect transitions — `_handleDisconnect()` and `_handleReconnect()` must update all GUI elements since no user click triggers the change. Failure to sync causes the GUI to show stale state.
 
 ## Disconnection Resilience
 
@@ -167,7 +151,6 @@ Same pattern for `YAG_2_*`. Typical triggered mode: Q-switch internal (0) + flas
 - **Auto-reconnect**: `_reconnectTimer` fires every 5 seconds, validates with `>cg` temperature query, calls `_handleReconnect()` on success
 - **State restore**: `_handleReconnect()` re-queries voltage, frequency, modes, energy from the laser
 - **Signal**: `connectionStatusChanged(bool)` signal emitted on connect/disconnect — hub uses this to gray out / restore tab text
-- **ZMQ behavior**: Server returns `{"status": "ERROR", "message": "laser disconnected"}` for CHECK_VALUE/PROGRAM_VALUE when laser is offline; PUB-SUB skips broadcasting for disconnected lasers
-- **BLACS handling**: `BigSkyWorker` in labscript-suite gracefully skips "laser disconnected" errors with `logger.warning` (same pattern as "unknown connection")
+- **BLACS link**: a set or press for a laser whose serial link is down is refused (`laser_disconnected`); a snapshot still reports its cached (reset) values
 
-**If modifying the ZMQ protocol** (connection names, message format, PUB-SUB topics), the BLACS device must also be updated. For BLACS architecture questions (state machines, Qt thread safety, device base classes), defer to the `amo-expert` agent in the labscript-suite workspace (`C:\Users\radmo\labscript-suite\.claude\agents\`).
+**If changing what BLACS can set, read or press**: change the menu (`bbx_zmq/menus/bigsky.py` in beambox-daq), bump its version, and change the handlers in `HugeSkyController.pyw` / `BigSkyControllerAmbitious.py` together.
