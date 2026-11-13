@@ -110,7 +110,7 @@ Before finalizing any code change:
 - `_attemptReconnect()` tries `serial.Serial(comPort, 9600, timeout=1)` + `>cg` temperature query. On success calls `_handleReconnect()`.
 - `_handleReconnect()` sets `serialConnected = True`, re-queries all laser state (voltage, freq, modes, energy), restores GUI, emits `connectionStatusChanged.emit(True)`.
 - Hub `_onConnectionChanged()` sets tab text to "(DISCONNECTED)" in red / restores on reconnect.
-- ZMQ server checks `ctrl.getSerialConnected()`: returns `{"status": "ERROR", "message": "laser disconnected"}` for CHECK_VALUE/PROGRAM_VALUE, skips PUB-SUB for offline lasers.
+- The BLACS menu link refuses a set or press for a laser whose serial link is down (`laser_disconnected`); a snapshot still reports its cached (reset) values.
 - `HomeTab._scanPorts()` (called by the public `refreshConnections()`) discovers lasers powered on after hub startup.
 
 ### Serial Communication Details
@@ -149,31 +149,6 @@ Before finalizing any code change:
 
 ## BLACS Integration
 
-This program is integrated into the BLACS experiment control system (labscript-suite at `C:\Users\radmo\labscript-suite`).
+BLACS (beambox-daq, device `bbx_devices/BigSkyHub`) talks to this GUI through the **menu link**: one shared menu file, `bbx_zmq/menus/bigsky.py` in the beambox-daq repo, holds the names, ranges, buttons, time limits and the port. This GUI serves it from `BigSkyMenuServer` / `BigSkyMenuLink` in `HugeSkyController.pyw` (one REP socket; no PUB stream, no heartbeat). The details (values, buttons, refusals, keep warm, Auto Arm Ext) are in this repo's `CLAUDE.md`, section "BLACS Integration".
 
-**Read `C:\Users\radmo\labscript-suite\userlib\user_devices\BLACS_COMMUNICATION_CONTRACT.md` for the full communication protocol** — it defines the ZMQ JSON format (REQ-REP + PUB-SUB), connection naming conventions, and BLACS shot lifecycle.
-
-- **BLACS device code**: `C:\Users\radmo\labscript-suite\userlib\user_devices\BigSkyHub\`
-- **BLACS base device (RemoteControl)**: `C:\Users\radmo\labscript-suite\userlib\user_devices\RemoteControl\` — the generic REQ-REP client that BLACS uses to talk to this server.
-- **Connection table**: `C:\Users\radmo\labscript-suite\userlib\labscriptlib\Main_Experiment\connection_table.py`
-
-**ZMQ ports**: REP on 55540, PUB on 55541 (configurable in `BigSkyZmqServer` constructor).
-
-**Shared connection names** (per laser, e.g. `YAG_1`; must match both this server and the BLACS device):
-- Writable (PROGRAM_VALUE): `YAG_1_voltage`, `YAG_1_shutter`, `YAG_1_lamps`, `YAG_1_qswitch`, `YAG_1_lamp_mode`, `YAG_1_qswitch_mode`, `YAG_1_warmup`, `YAG_1_start_lasing`, `YAG_1_stop`
-- Checkable (CHECK_VALUE only, no PUB): `YAG_1_lamp_mode`, `YAG_1_qswitch_mode` — readable writable state, supported via `getLampMode()`/`getQSwitchMode()` getters
-- Writable (PROGRAM_VALUE), 10 params per laser: `voltage`, `shutter`, `lamps`, `qswitch`, `lamp_mode`, `qswitch_mode`, `warmup`, `start_lasing`, `stop`, `keep_warm`. (`keep_warm` is dispatched in `_handleRemoteCommand` for tab-side hysteresis sync; do not omit from the writable list.)
-- Hub state: per-laser independent. No cross-laser interlocks live in `HugeSkyController.pyw`. Each `SingleLaserController` owns its own serial port, `_stateLock`, `_reconnectTimer`. The hub owns only the ZMQ server, tab container, `_laserLaunchOrder` counter, and `LASER_SN_TO_CONNECTION` dict (populated 2026-05-19 with `{'151':'YAG_1','213':'YAG_2'}`).
-- Monitors (CHECK_VALUE + PUB): `YAG_1_temperature_monitor`, `YAG_1_voltage_monitor`, `YAG_1_lamps_monitor`, `YAG_1_shutter_monitor`, `YAG_1_qswitch_monitor`
-- Command-only (PROGRAM_VALUE only, no CHECK_VALUE): `YAG_1_warmup`, `YAG_1_start_lasing`, `YAG_1_stop` — fire-and-forget, BLACS skips these in `check_remote_values`
-- Same pattern for `YAG_2_*`
-
-**Typical triggered mode**: Q-switch internal (0) + flashlamp external (1). BLACS sequence: stop → qswitch_mode=0 → lamp_mode=1 → voltage → lamps=1 → shutter=1 → qswitch=1.
-
-**If modifying the ZMQ protocol** (connection names, message format, PUB-SUB topics), the BLACS device must also be updated. For BLACS architecture questions (state machines, Qt thread safety, device base classes), defer to the `amo-expert` agent in the labscript-suite workspace (`C:\Users\radmo\labscript-suite\.claude\agents\`).
-
-### ZMQ Server Architecture
-
-The `BigSkyZmqServer` class lives in `HugeSkyController.pyw`. It runs a daemon thread with REP+PUB sockets. Connection names are parsed as `{laser_base}_{param}[_monitor]` and dispatched to the correct `SingleLaserController` via `executeRemoteCommand(param, value, future)` signal/slot pattern for thread safety, where `future` is a `concurrent.futures.Future` that the slot writes a `{"status", "message"}` dict to. The ZMQ thread reads the dict via `future.result(timeout=...)` and forwards it as the REP reply, so rejection paths (e.g. mode change while laser is firing) propagate as `{"status": "ERROR", "message": "rejected: ..."}` instead of silent SUCCESS. All serial I/O happens on the Qt main thread; the ZMQ thread only reads cached state (via thread-safe getters) or emits signals.
-
-**Reference implementation**: `C:\Users\radmo\labscript-suite\GUIs\rastering\raster_controller.py:_zmq_loop()` — same protocol pattern.
+**If changing what BLACS can set, read or press**: change the menu file, bump its version, and change the handlers here together (BLACS refuses to run shots when the menu versions differ).

@@ -14,7 +14,7 @@ import concurrent.futures
 # The menu link to BLACS comes from the beambox-daq package bbx_zmq (BBX-189).
 # Install once into this GUI's Python:  python -m pip install -e <beambox-daq> --no-deps
 # (or put <beambox-daq>\src first on PYTHONPATH). The Big Sky menu, the same file BLACS loads:
-# bbx_zmq/menus/bigsky.py (names, ranges, buttons, time limits, port 55540).
+# bbx_zmq/menus/bigsky.py (names, ranges, buttons, time limits, port).
 from bbx_zmq import MenuServer, Refused, ZmqRepTransport
 from bbx_zmq.menus.bigsky import MENU
 
@@ -93,7 +93,7 @@ class BigSkyMenuLink:
 
 
 class BigSkyMenuServer(QObject):
-  """The menu server on its own thread, on the menu's port (REP, tcp://*:55540)."""
+  """The menu server on its own thread, on the menu's port (REP, tcp://*:<MENU.port>)."""
   logMessage = pyqtSignal(str)
 
   def __init__(self, parent=None):

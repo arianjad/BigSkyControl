@@ -113,8 +113,8 @@ Mode changes (Q-switch mode, lamp mode) require the laser to be in standby first
 
 BLACS (beambox-daq, device `bbx_devices/BigSkyHub`) talks to this GUI through one shared
 **menu**: `bbx_zmq/menus/bigsky.py` in the beambox-daq repo. BLACS and this GUI load the same
-file: the names, ranges, buttons, time limits and the port (REP **55540**; no PUB stream, no
-heartbeat). Wire format: the v2 request/reply envelope of `bbx_zmq.zmq_v2`; actions HELLO,
+file: the names, ranges, buttons, time limits and the port (one REP socket; the port number is
+written in the menu only; no PUB stream, no heartbeat). Wire format: the v2 request/reply envelope of `bbx_zmq.zmq_v2`; actions HELLO,
 SNAPSHOT, SET, PRESS.
 
 - `HugeSkyController.pyw`: `BigSkyMenuServer` (thread, port) and `BigSkyMenuLink` (the handlers).
