@@ -903,6 +903,8 @@ class SingleLaserController(QtWidgets.QWidget, Ui_Widget):
   def _remoteDo(self, command, value):
     jobs = {'arm': self.startLaser, 'warm_up': self.startWarmup, 'stop': self.stopLaser}
     if command in jobs:
+      if not int(round(float(value))):    # a job set to 0 (a sequence's "not now"): nothing to do
+        return None
       words = jobs[command]()
       if words: raise RemoteRefused("failed_at_step", words)
       return None

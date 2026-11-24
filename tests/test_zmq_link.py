@@ -173,6 +173,16 @@ def test_warmup_and_stop_say_which_step_failed(gui, laser):
     assert "stop failed at step 1 of 1 (standby" in reply["error"]["message"]
 
 
+def test_a_job_set_to_0_does_nothing(gui, laser):
+    """Harm stopped: a sequence that sets YAG_1_start_lasing to 0 (meaning "do not arm") arms
+    the laser: lamps fire, shutter opens, Q-switch on. Likewise warmup 0 fires the lamps and
+    stop 0 stops a laser that should keep running. A job set to 0 sends nothing to the laser
+    and answers SUCCESS."""
+    for job in ("start_lasing", "warmup", "stop"):
+        assert set_(gui, "YAG_1_" + job, 0)["status"] == "SUCCESS", job
+    assert [c for c in laser.sent if c != ">cg"] == []
+
+
 def test_a_voltage_is_answered_with_what_the_laser_reads_back(gui, laser):
     """Harm stopped: BLACS records a flashlamp voltage the laser did not take (it clamped or
     ignored the set), so the shot file says 1500 V for a shot fired at another voltage. A set is

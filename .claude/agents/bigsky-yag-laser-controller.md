@@ -110,7 +110,7 @@ Before finalizing any code change:
 - `_attemptReconnect()` tries `serial.Serial(comPort, 9600, timeout=1)` + `>cg` temperature query. On success calls `_handleReconnect()`.
 - `_handleReconnect()` sets `serialConnected = True`, re-queries all laser state (voltage, freq, modes, energy), restores GUI, emits `connectionStatusChanged.emit(True)`.
 - Hub `_onConnectionChanged()` sets tab text to "(DISCONNECTED)" in red / restores on reconnect.
-- The BLACS menu link refuses a set or press for a laser whose serial link is down (`laser_disconnected`); a snapshot still reports its cached (reset) values.
+- For a laser whose serial link is down, the BLACS link answers every set, job or read with `ERROR laser_disconnected`, and publishes none of its values.
 - `HomeTab._scanPorts()` (called by the public `refreshConnections()`) discovers lasers powered on after hub startup.
 
 ### Serial Communication Details
@@ -149,6 +149,6 @@ Before finalizing any code change:
 
 ## BLACS Integration
 
-BLACS (beambox-daq, device `bbx_devices/BigSkyHub`) talks to this GUI through the **menu link**: one shared menu file, `bbx_zmq/menus/bigsky.py` in the beambox-daq repo, holds the names, ranges, buttons, time limits and the port. This GUI serves it from `BigSkyMenuServer` / `BigSkyMenuLink` in `HugeSkyController.pyw` (one REP socket; no PUB stream, no heartbeat). The details (values, buttons, refusals, keep warm, Auto Arm Ext) are in this repo's `CLAUDE.md`, section "BLACS Integration".
+BLACS (beambox-daq, Big Sky device) talks to this GUI with RaX's RemoteControl protocol v2 (`bbx_zmq.zmq_v2`, RaX's file). `_BigSkyV2Server` and `BigSkyZmqServer` in `HugeSkyController.pyw` serve it: REQ/REP on `tcp://*:55540` (`HELLO`, `PING`, `PROGRAM_VALUE`, `CHECK_VALUE`) and PUB on `tcp://*:55541` (`YAG_1_<name>_monitor <value>` every 250 ms, `heartbeat` once a second, from its own thread). Sets and the jobs `start_lasing`, `warmup`, `stop` (value 0: nothing done) run on the tab's Qt thread through `executeRemoteCommand`; a `RemoteRefused` comes back `REJECTED` with its code and words. The names, answers and keep-warm rule are in this repo's `CLAUDE.md`, "How it is built".
 
-**If changing what BLACS can set, read or press**: change the menu file, bump its version, and change the handlers here together (BLACS refuses to run shots when the menu versions differ).
+**If changing what BLACS can set, read or do**: change the names in `_COMMANDS` (`HugeSkyController.pyw`), the handlers in `_remoteDo`, and BLACS's Big Sky device in beambox-daq together; an old BLACS talking to a new GUI gets `unknown_action`.
