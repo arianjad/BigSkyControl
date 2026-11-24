@@ -296,3 +296,20 @@ def test_keep_warm_warms_a_cold_laser_once_and_never_an_armed_one(gui, laser):
     laser.sent.clear()
     gui.ctrl.pollTemperature()                                     # cold, standby: warm-up
     assert [c for c in laser.sent if c not in (">cg", ">qsm")] == [">s", ">lpm0", ">a"]
+
+
+def test_the_port_scan_never_opens_the_qc_or_prawnblaster_port(hsc_module, monkeypatch):
+    """Harm stopped: the GUI started before BLACS (any order, as RaX) opens COM10 and COM11 at
+    9600 baud and writes ">sn": junk to the Quantum Composer and the PrawnBlaster, and a port held
+    open just when BLACS opens it. The scan skips the ports in NOT_LASERS."""
+    opened = []
+
+    def fake_serial(dev, *a, **k):
+        opened.append(dev)
+        raise OSError("not a laser")                      # the scan then goes on
+
+    monkeypatch.setattr(hsc_module.serial.tools.list_ports, "comports",
+                        lambda: [types.SimpleNamespace(device=d) for d in ("COM5", "COM10", "COM11")])
+    monkeypatch.setattr(hsc_module.serial, "Serial", fake_serial)
+    hsc_module.HomeTab._scanPorts(types.SimpleNamespace(devices=[]))
+    assert opened == ["COM5"]

@@ -190,6 +190,11 @@ class BigSkyZmqServer(QObject):
 
 # --- Connection Name Mapping ---
 # Maps laser serial numbers to BLACS connection names.
+# COM ports that hold other instruments: the port scan never opens them, so ">sn" at 9600 baud
+# never reaches them and the GUI can start before or after BLACS (which holds them) in any order.
+# BeamBox: COM10 the Quantum Composer, COM11 the PrawnBlaster.
+NOT_LASERS = {"COM10", "COM11"}
+
 # Edit this dict to match your physical setup.
 # Serial numbers are strings as returned by the >sn command.
 LASER_SN_TO_CONNECTION = {
@@ -275,8 +280,8 @@ class HomeTab(QWidget):
     possibleDevices = [comport.device for comport in serial.tools.list_ports.comports()]
     print(possibleDevices)
     for dev in possibleDevices:
-      if dev in self.devices:
-        continue  # already known
+      if dev in self.devices or dev.upper() in NOT_LASERS:
+        continue  # already known, or another instrument (never sent >sn)
       try:
         print('trying com port %s' % dev)
         ser = serial.Serial(dev, 9600, timeout=1)
