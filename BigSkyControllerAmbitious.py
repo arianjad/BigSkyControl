@@ -18,7 +18,7 @@ _TRAILING_INT_RE = re.compile(r'(-?\d+)\s*$')
 
 class RemoteRefused(Exception):
   """A remote (BLACS) request this laser could not do: `code` for programs, `words` for people.
-  HugeSkyController turns it into the menu link's refusal, so BLACS gets both."""
+  HugeSkyController answers it to BLACS as REJECTED with this code and these words."""
   def __init__(self, code, words):
     super().__init__("[%s] %s" % (code, words))
     self.code = code
@@ -850,7 +850,7 @@ class SingleLaserController(QtWidgets.QWidget, Ui_Widget):
     Uses hysteresis to prevent oscillation:
     - Triggers warmup when temp drops below TEMP_COLD (37°C)
     - Resets trigger when temp rises to TEMP_OPERATING (39°C)
-    The one keep-warm rule (BLACS has none; it only ticks this box through the menu link).
+    The one keep-warm rule (BLACS has none; it only ticks this box through the BLACS link).
     An armed laser (lamps, shutter, Q-switch on) is left alone: a warm-up would drop it out of
     its armed state in the middle of a run. It is warmed once it is no longer armed.
     """
@@ -868,13 +868,13 @@ class SingleLaserController(QtWidgets.QWidget, Ui_Widget):
       if self._warmupTriggered:
         self._warmupTriggered = False
 
-  # --- What BLACS reads and does (HugeSkyController's menu server, bbx_zmq/menus/bigsky.py) ---
-  # The menu server has already checked the name and the range against the Big Sky menu; these
-  # handlers add only what needs the laser's state (shutter before lamps, modes in standby).
+  # --- What BLACS reads and does (HugeSkyController's BLACS link, RaX RemoteControl v2) ---
+  # These handlers refuse only what the laser's order needs (shutter needs the lamps, Q-switch
+  # needs lamps and shutter, modes need standby) and a read-back that differs from the ask.
 
   def remoteSnapshot(self):
-    """Every menu value of this laser, from the GUI's cached state. Thread-safe read (the menu
-    server's thread)."""
+    """Every value BLACS can read of this laser, from the GUI's cached state. Thread-safe read
+    (the link's threads)."""
     with self._stateLock:
       return {"voltage": self.fLampVoltage, "lamps": int(self.activeStatus),
               "shutter": int(self.shutterStatus), "qswitch": int(self.qSwitchStatus),
@@ -882,7 +882,7 @@ class SingleLaserController(QtWidgets.QWidget, Ui_Widget):
               "temperature": float(self.lastTemperature), "keep_warm": int(bool(self.keepWarmActive))}
 
   def executeRemoteCommand(self, command, value, future):
-    """Called from the menu server's thread: runs `command` on the Qt main thread (where the
+    """Called from the link's request thread: runs `command` on the Qt main thread (where the
     serial port and the widgets live). `future` gets the result (what was really set; None for
     a button), or the exception: RemoteRefused(code, words) when it could not be done."""
     self._remoteCommandRequested.emit(command, value, future)

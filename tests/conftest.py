@@ -2,8 +2,8 @@
 
 test_serial_gateway.py (B1-B4) tests PRODUCTION CODE (real unbound methods of
 `SingleLaserController`) against duck-typed `self` objects -- no Qt event
-loop, no real serial port, no ZMQ sockets. test_menu_server.py (BBX-189) runs
-the real controller and the real BLACS menu server in memory, on a fake laser.
+loop, no real serial port, no ZMQ sockets. test_zmq_link.py runs the real
+controller and the real BLACS link (RaX RemoteControl v2) in memory, on a fake laser.
 
 The GUI loads GuiBigSkyWidget.ui by a relative path, so the session runs in
 this GUI's folder (wherever pytest was started).

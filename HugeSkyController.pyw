@@ -11,122 +11,155 @@ import pickle
 import threading
 import concurrent.futures
 
-# The menu link to BLACS comes from the beambox-daq package bbx_zmq (BBX-189).
-# Install once into this GUI's Python:  python -m pip install -e <beambox-daq> --no-deps
-# (or put <beambox-daq>\src first on PYTHONPATH). The Big Sky menu, the same file BLACS loads:
-# bbx_zmq/menus/bigsky.py (names, ranges, buttons, time limits, port).
-from bbx_zmq import MenuServer, Refused, ZmqRepTransport
-from bbx_zmq.menus.bigsky import MENU
+# The BLACS link speaks RaX's RemoteControl protocol v2: REQ/REP for requests, PUB/SUB for the
+# live values. zmq_v2 is RaX's file, in the beambox-daq package bbx_zmq. Install once into this
+# GUI's Python:  python -m pip install -e <beambox-daq> --no-deps
+from bbx_zmq.zmq_v2 import (RemoteControlServerBase, handler, encode_reply, PROTOCOL_VERSION,
+                            ZmqRepTransport)
 
 
-# --- BLACS link: the menu server and its handlers ---
+# --- BLACS link (adapted from upstream HugeSkyController.pyw: _BigSkyV2Server, BigSkyZmqServer) ---
+
+REP_PORT = 55540               # requests from BLACS (upstream DEFAULT_REP_PORT)
+PUB_PORT = 55541               # monitors and heartbeat (upstream DEFAULT_PUB_PORT)
+_REMOTE_CMD_TIMEOUT_S = 10.0   # longest wait for the laser tab to finish a set or a job (upstream)
+
+# Name on the wire (after "YAG_1_") -> this GUI's command (SingleLaserController._remoteDo).
+_COMMANDS = {'voltage': 'voltage', 'lamps': 'lamps', 'shutter': 'shutter', 'qswitch': 'qswitch',
+             'lamp_mode': 'lamp_mode', 'qswitch_mode': 'qswitch_mode', 'keep_warm': 'keep_warm',
+             'start_lasing': 'arm', 'warmup': 'warm_up', 'stop': 'stop'}
 
 
-class BigSkyMenuLink:
-  """The handlers of this GUI's menu server, on the lasers this hub has open.
+def _error(status, code, words, request_id, retryable=False):
+  return encode_reply(status=status, request_id=request_id,
+                      error={"code": code, "message": words, "retryable": retryable})
 
-  BLACS reads every value in one snapshot, sets one value, or presses one button (arm, warm_up,
-  stop); names are "<laser>_<name>" (YAG_1_voltage). The menu server (bbx_zmq MenuServer)
-  refuses, before these handlers run, a name that is not on the Big Sky menu, a laser that is
-  not open and a value out of range. A set or press then runs on the laser's own Qt thread; this
-  waits for it up to the menu's time limit and answers what really happened, or refuses with
-  the laser's code and words (an arm that stopped at a step: "failed_at_step").
-  """
 
-  def __init__(self, log=print):
-    self._lasers = {}     # {"YAG_1": SingleLaserController}
-    self._log = log
+class _BigSkyV2Server(RemoteControlServerBase):
+  """Answers BLACS's requests (HELLO, PING, PROGRAM_VALUE, CHECK_VALUE) for the open lasers.
+  Names are "<laser>_<name>" (YAG_1_voltage); a read also takes "<laser>_<name>_monitor"."""
+  CAPABILITIES = frozenset({"monitors", "heartbeat"})
 
-  def addLaser(self, name, controller):
-    self._lasers[name] = controller
+  def __init__(self, link, transport):
+    super().__init__("BigSkyLasers", transport)
+    self._link = link
 
-  def removeLaser(self, name):
-    self._lasers.pop(name, None)
+  def _handle_hello(self, request_id):
+    return encode_reply(status="SUCCESS", request_id=request_id, extra={
+        "protocol_version": PROTOCOL_VERSION, "server": self._server_name,
+        "capabilities": sorted(self.CAPABILITIES),
+        "connections": ["%s_*" % laser for laser in sorted(self._link.lasers)]})
 
-  def units(self):
-    return sorted(self._lasers)
+  def _find(self, connection, request_id):
+    """(controller, name, is_monitor), or the reply that refuses the request."""
+    name = connection[:-len("_monitor")] if connection.endswith("_monitor") else connection
+    for laser in sorted(self._link.lasers, key=len, reverse=True):     # YAG_10 before YAG_1
+      if name.startswith(laser + "_"):
+        ctrl = self._link.lasers[laser]
+        if not ctrl.isConnected():
+          return _error("ERROR", "laser_disconnected", "%s: the laser's serial link is down" % laser,
+                        request_id, retryable=True)
+        return ctrl, name[len(laser) + 1:], name != connection
+    return _error("UNKNOWN_CONNECTION", "unknown_connection", "no open laser for %r" % connection,
+                  request_id)
 
-  def readAll(self):
-    snap = {}
-    for name, ctrl in list(self._lasers.items()):
-      snap.update({"%s_%s" % (name, k): v for k, v in ctrl.remoteSnapshot().items()})
-    return snap
-
-  def setValue(self, wire_name, value):
-    laser, item = self._split(wire_name)
-    limit_s = MENU.value(wire_name, [laser]).set_s
-    return self._onLaser(laser, item, value, limit_s, "%s = %s" % (wire_name, value))
-
-  def pressButton(self, wire_name):
-    laser, item = self._split(wire_name)
-    return self._onLaser(laser, item, None, MENU.button(wire_name, [laser]).press_s, wire_name)
-
-  def menuServer(self, transport):
-    return MenuServer(MENU, transport, read_all=self.readAll, set_value=self.setValue,
-                      press_button=self.pressButton, units=self.units)
-
-  def _split(self, wire_name):
-    for laser in sorted(self._lasers, key=len, reverse=True):   # YAG_10 before YAG_1
-      if wire_name.startswith(laser + "_"):
-        return laser, wire_name[len(laser) + 1:]
-    raise Refused("not_on_menu", "no open laser for %r" % wire_name)
-
-  def _onLaser(self, laser, command, value, limit_s, what):
-    ctrl = self._lasers.get(laser)
-    if ctrl is None:
-      raise Refused("not_on_menu", "%s is not open in this GUI" % laser)
-    if not ctrl.isConnected():
-      raise Refused("laser_disconnected", "%s: the laser's serial link is down" % laser)
-    self._log("BLACS: %s" % what)
+  @handler("PROGRAM_VALUE")
+  def _handle_program(self, connection, value, args, request_id):
+    """Runs the set or job on the laser tab's Qt thread and answers what really happened."""
+    found = self._find(connection, request_id)
+    if isinstance(found, bytes):
+      return found
+    ctrl, name, is_monitor = found
+    if is_monitor:
+      return _error("ERROR", "cannot_program_monitor", "%r is a read-out" % connection, request_id)
+    if name not in _COMMANDS:
+      return _error("ERROR", "unknown_writable_param", "%r cannot be set" % connection, request_id)
+    self._link.log("BLACS: %s = %s" % (connection, value))
     future = concurrent.futures.Future()
-    ctrl.executeRemoteCommand(command, value, future)
+    ctrl.executeRemoteCommand(_COMMANDS[name], value, future)
     try:
-      result = future.result(timeout=limit_s)
+      result = future.result(timeout=_REMOTE_CMD_TIMEOUT_S)
     except concurrent.futures.TimeoutError:
       future.cancel()      # not started yet: it never runs
-      raise Refused("gui_busy", "%s: not finished within %.0f s (if it had started, it may still "
-                                "finish; look at the GUI)" % (what, limit_s)) from None
+      return _error("TIMEOUT", "command_timeout",
+                    "%s: not finished within %.0f s (if it had started, it may still finish; look "
+                    "at the GUI)" % (connection, _REMOTE_CMD_TIMEOUT_S), request_id, retryable=True)
     except RemoteRefused as e:
-      self._log("BLACS: %s refused: [%s] %s" % (what, e.code, e.words))
-      raise Refused(e.code, e.words) from None
-    return result
+      self._link.log("BLACS: %s refused: [%s] %s" % (connection, e.code, e.words))
+      return _error("REJECTED", e.code, e.words, request_id)
+    return encode_reply(status="SUCCESS", request_id=request_id, value=result)
+
+  @handler("CHECK_VALUE")
+  def _handle_check(self, connection, value, args, request_id):
+    found = self._find(connection, request_id)
+    if isinstance(found, bytes):
+      return found
+    ctrl, name, _ = found
+    snap = ctrl.remoteSnapshot()
+    if name not in snap:
+      return _error("ERROR", "unknown_monitor_param", "%r cannot be read" % connection, request_id)
+    return encode_reply(status="SUCCESS", request_id=request_id, value=snap[name])
 
 
-class BigSkyMenuServer(QObject):
-  """The menu server on its own thread, on the menu's port (REP, tcp://*:<MENU.port>)."""
+class BigSkyZmqServer(QObject):
+  """The BLACS link: REP on tcp://*:55540 and PUB on tcp://*:55541, each on its own thread, so
+  the heartbeat keeps coming while a request waits up to 10 s for the laser."""
   logMessage = pyqtSignal(str)
 
   def __init__(self, parent=None):
     super().__init__(parent)
-    self.link = BigSkyMenuLink(log=self._log)
+    self.lasers = {}       # {"YAG_1": SingleLaserController}
+    self._turn = 0
     self._stop_event = threading.Event()
-    self._thread = None
+    self._threads = []
+
+  def addLaser(self, name, controller):
+    self.lasers[name] = controller
+
+  def removeLaser(self, name):
+    self.lasers.pop(name, None)
+
+  def requestServer(self, transport):
+    return _BigSkyV2Server(self, transport)
+
+  def publish_once(self, publish):
+    """One turn of the PUB stream (every 250 ms): "<laser>_<name>_monitor <value>" for every
+    value of every open laser whose serial link is up; "heartbeat" every fourth turn."""
+    self._turn += 1
+    for laser, ctrl in list(self.lasers.items()):
+      if ctrl.isConnected():     # a laser whose serial link is down is not published (upstream)
+        for name, value in ctrl.remoteSnapshot().items():
+          publish("%s_%s_monitor %s" % (laser, name, value))
+    if self._turn % 4 == 0:
+      publish("heartbeat")
 
   def start(self):
-    if self._thread is not None and self._thread.is_alive():
-      self._log("BLACS link: already running."); return
+    if any(t.is_alive() for t in self._threads):
+      self.log("BLACS link: already running."); return
     self._stop_event.clear()
-    self._thread = threading.Thread(target=self._serverLoop, daemon=True, name="BigSkyMenuServer")
-    self._thread.start()
+    self._threads = [threading.Thread(target=f, daemon=True, name=n) for f, n in
+                     ((self._requestLoop, "BigSkyREP"), (self._publishLoop, "BigSkyPUB"))]
+    for t in self._threads:
+      t.start()
 
   def stop(self):
     self._stop_event.set()
-    if self._thread is not None:
-      self._thread.join(timeout=3.0)
-      self._thread = None
-    self._log("BLACS link: stopped.")
+    for t in self._threads:
+      t.join(timeout=3.0)
+    self._threads = []
+    self.log("BLACS link: stopped.")
 
-  def _log(self, msg):
+  def log(self, msg):
     print(msg)
     self.logMessage.emit(msg)
 
-  def _serverLoop(self):
+  def _requestLoop(self):
     try:
-      transport = ZmqRepTransport("tcp://*:%d" % MENU.port, recv_timeout_ms=250)
+      transport = ZmqRepTransport("tcp://*:%d" % REP_PORT, recv_timeout_ms=250)
     except Exception as e:     # noqa: BLE001  (port taken, no pyzmq): the GUI runs without BLACS
-      self._log("BLACS link: not started, port %d: %s" % (MENU.port, e)); return
-    server = self.link.menuServer(transport)
-    self._log("BLACS link: menu %s v%d on port %d." % (MENU.name, MENU.version, MENU.port))
+      self.log("BLACS link: no requests, port %d: %s" % (REP_PORT, e)); return
+    server = self.requestServer(transport)
+    self.log("BLACS link: RemoteControl v2, REP port %d, PUB port %d." % (REP_PORT, PUB_PORT))
     failures = 0
     while not self._stop_event.is_set():
       try:
@@ -134,10 +167,25 @@ class BigSkyMenuServer(QObject):
         failures = 0
       except Exception as e:   # noqa: BLE001  (handler errors are answered; this is the socket)
         failures += 1
-        self._log("BLACS link: socket error (%d/5): %s" % (failures, e))
+        self.log("BLACS link: socket error (%d/5): %s" % (failures, e))
         if failures >= 5:
-          self._log("BLACS link: too many socket errors; stopped."); break
+          self.log("BLACS link: too many socket errors; requests stopped."); break
     transport.close()
+
+  def _publishLoop(self):
+    try:
+      import zmq
+      sock = zmq.Context.instance().socket(zmq.PUB)
+      sock.setsockopt(zmq.LINGER, 0)
+      sock.bind("tcp://*:%d" % PUB_PORT)
+    except Exception as e:     # noqa: BLE001  (port taken, no pyzmq): the GUI runs without the stream
+      self.log("BLACS link: no PUB stream, port %d: %s" % (PUB_PORT, e)); return
+    while not self._stop_event.wait(0.25):
+      try:
+        self.publish_once(sock.send_string)
+      except Exception as e:   # noqa: BLE001  (a tab closing mid-turn): the next turn goes on
+        self.log("BLACS link: publish error: %s" % e)
+    sock.close()
 
 
 # --- Connection Name Mapping ---
@@ -159,8 +207,8 @@ LASER_SN_TO_CONNECTION = {
 class BigSkyHub(QMainWindow):
   def __init__(self, noLaser=False):
     """noLaser: the no-laser mode (`--no-laser`): no COM port is scanned or opened; one dummy
-    laser, YAG_1, is open (no serial port), so BLACS can connect and read; every set or press
-    is refused at once with laser_disconnected (the laser's serial link is down)."""
+    laser, YAG_1, is open (no serial port): BLACS gets HELLO and the heartbeat; every set or
+    read of YAG_1 answers laser_disconnected, and no YAG_1 value is published."""
     super().__init__()
     self.setWindowTitle('Big Sky Controller Hub' + (' (no laser)' if noLaser else ''))
     self.setWindowIcon(QIcon('BigSkyDesktopIcon.ico'))
@@ -168,8 +216,8 @@ class BigSkyHub(QMainWindow):
     self.top = 0 ; self.height = 800
     self.setGeometry(self.left, self.top, self.width, self.height)
 
-    # BLACS link (the menu server); lasers are added to it as their tabs open
-    self.zmqServer = BigSkyMenuServer(parent=self)
+    # BLACS link; lasers are added to it as their tabs open
+    self.zmqServer = BigSkyZmqServer(parent=self)
     self.zmqServer.logMessage.connect(self._onZmqLog)
     self.table_widget = MyTableWidget(self, noLaser=noLaser)
     self.setCentralWidget(self.table_widget)
@@ -341,7 +389,7 @@ class MyTableWidget(QWidget):
     """Open the laser to BLACS under connName (YAG_1, ...)."""
     ctrl._zmqConnectionName = connName  # stash on controller for unregister lookup
     ctrl._tabLabel = labelString  # store original label for disconnect/reconnect styling
-    self.parent.zmqServer.link.addLaser(connName, ctrl)
+    self.parent.zmqServer.addLaser(connName, ctrl)
     self.homeTab.text.append("BLACS link: laser open as '%s'" % connName)
 
     # Connect disconnect/reconnect signal to tab styling
@@ -374,7 +422,7 @@ class MyTableWidget(QWidget):
     # Close it to BLACS
     connName = getattr(widget, '_zmqConnectionName', None)
     if connName:
-      self.parent.zmqServer.link.removeLaser(connName)
+      self.parent.zmqServer.removeLaser(connName)
 
     widget.safeExit()
     self.tabs.removeTab(i)
