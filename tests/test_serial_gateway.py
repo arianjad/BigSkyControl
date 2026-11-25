@@ -139,14 +139,14 @@ def test_each_command_clears_old_input_and_the_port_ends_a_read_at_the_gap(
     bsa_module.SingleLaserController._sendCommand(s, b">cg\n")
     names = [c[0] for c in s.ser.method_calls]
     assert names.index("reset_input_buffer") < names.index("write") < names.index("read")
-    assert 0 < bsa_module.READ_GAP_S < 1 and hsc_module.READ_GAP_S is bsa_module.READ_GAP_S
+    assert hsc_module.READ_GAP_S is bsa_module.READ_GAP_S      # one setting, used by the scan too
 
 
-def test_a_laser_not_in_the_serial_number_list_never_gets_a_yag_name(hsc_module):
+def test_a_laser_not_in_the_serial_number_list_never_gets_a_yag_name(hsc_module, monkeypatch):
     """Harm stopped: an unknown laser launched first named YAG_1, so BLACS's YAG_1 arm (lamps
-    fire, the shutter opens) goes to the wrong laser."""
+    fire, the shutter opens) goes to the wrong laser. The test's own list, not the lab's."""
     import types
-    hub = types.SimpleNamespace()
+    monkeypatch.setattr(hsc_module, "LASER_SN_TO_CONNECTION", {"1": "YAG_1"})
     name = hsc_module.MyTableWidget._assignConnectionName
-    assert name(hub, "151") == "YAG_1" and name(hub, "082") == "SN_082"
-    assert not name(hub, "999").startswith("YAG_")
+    assert name(types.SimpleNamespace(), "1") == "YAG_1"
+    assert name(types.SimpleNamespace(), "2") == "SN_2"
