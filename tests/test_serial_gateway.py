@@ -156,6 +156,15 @@ def test_an_answer_that_pauses_after_its_cr_lf_is_read_whole(bsa_module):
     assert bsa_module.read_reply(Line()) == b""
 
 
+def test_a_laser_not_in_the_serial_number_list_never_gets_a_yag_name(hsc_module, monkeypatch):
+    """Harm stopped: another laser launched first named YAG_1, so BLACS's YAG_1 arm (lamps fire,
+    the shutter opens) goes to the wrong laser. The test's own list, not the lab's."""
+    import types
+    monkeypatch.setattr(hsc_module, "LASER_SN_TO_CONNECTION", {"1": "YAG_1"})
+    name = hsc_module.MyTableWidget._assignConnectionName
+    assert name(types.SimpleNamespace(), "2") == "SN_2" and name(types.SimpleNamespace(), "1") == "YAG_1"
+
+
 def test_the_port_scan_opens_a_port_with_the_short_read_gap(hsc_module, monkeypatch):
     """Harm stopped: the scan's >sn read waiting the full 1 s per port, or cutting the answer."""
     import types

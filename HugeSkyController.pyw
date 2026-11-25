@@ -197,12 +197,10 @@ NOT_LASERS = {"COM10", "COM11", "COM6"}   # QC, PrawnBlaster, Lake Shore 336 tem
 
 # Edit this dict to match your physical setup.
 # Serial numbers are strings as returned by the >sn command.
-# 151 and 213 are RaX's lasers. BeamBox's (laserNames.pkl): 261 NEPTUNE Ablation, 093 NEPTUNE
-# Ionization, 023 Ablation, 082 a test entry. None is listed yet: a laser not listed gets YAG_1,
-# YAG_2, ... in the order its tab is launched, so launch the laser BLACS drives first.
+# The laser BLACS drives. Other lasers here (laserNames.pkl: 261 NEPTUNE Ablation, 093 NEPTUNE
+# Ionization) open as SN_<serial>, a name BLACS does not use, whatever the launch order.
 LASER_SN_TO_CONNECTION = {
-  '151': 'YAG_1',
-  '213': 'YAG_2',
+  '023': 'YAG_1',     # Ablation, COM5
 }
 
 
@@ -348,7 +346,6 @@ class MyTableWidget(QWidget):
     #self.tabs.resize(width,height)
     self.homeTab=HomeTab(self, scan=not noLaser)
     print("test: ", len(self.homeTab.buttons))
-    self._laserLaunchOrder = 0   # fallback names YAG_1, YAG_2, ... for lasers not in LASER_SN_TO_CONNECTION
 
     for i in range(len(self.homeTab.buttons)):
       self.homeTab.buttons[i].pressed.connect(lambda i=i: self.createTab(i))
@@ -366,12 +363,10 @@ class MyTableWidget(QWidget):
 
   def _assignConnectionName(self, serialNumber):
     """The BLACS connection name for a laser: LASER_SN_TO_CONNECTION (keyed by serial number),
-    else YAG_1, YAG_2, ... in launch order."""
+    else SN_<serial>. A laser not listed never gets a YAG_N name, so a BLACS request for YAG_1
+    (arm: lamps fire, the shutter opens) cannot reach it because it was launched first."""
     sn = str(serialNumber)
-    if sn in LASER_SN_TO_CONNECTION:
-      return LASER_SN_TO_CONNECTION[sn]
-    self._laserLaunchOrder += 1
-    return "YAG_%d" % self._laserLaunchOrder
+    return LASER_SN_TO_CONNECTION.get(sn, "SN_%s" % sn)
 
   def createTab(self, i):
     com=self.homeTab.devices[i]; labelString=self.homeTab.labelLineEdits[i].text()
