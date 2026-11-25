@@ -142,11 +142,30 @@ def test_each_command_clears_old_input_and_the_port_ends_a_read_at_the_gap(
     assert hsc_module.READ_GAP_S is bsa_module.READ_GAP_S      # one setting, used by the scan too
 
 
-def test_a_laser_not_in_the_serial_number_list_never_gets_a_yag_name(hsc_module, monkeypatch):
-    """Harm stopped: an unknown laser launched first named YAG_1, so BLACS's YAG_1 arm (lamps
-    fire, the shutter opens) goes to the wrong laser. The test's own list, not the lab's."""
+def test_an_answer_that_pauses_after_its_cr_lf_is_read_whole(bsa_module):
+    """Harm stopped: the laser sends CR LF, then its message after a pause longer than READ_GAP_S;
+    the read returns only CR LF, the command counts as unanswered (an arm "fails" while the
+    lamps fire) and three in a row drop the link."""
+    class Line:
+        def __init__(self, *parts):
+            self.parts = list(parts)
+        def read(self, n):
+            return self.parts.pop(0) if self.parts else b""
+    assert bsa_module.read_reply(Line(b"\r\n", b"voltage 0900 V")) == b"\r\nvoltage 0900 V"
+    assert bsa_module.read_reply(Line(b"\r\nvoltage 0900 V")) == b"\r\nvoltage 0900 V"
+    assert bsa_module.read_reply(Line()) == b""
+
+
+def test_the_port_scan_opens_a_port_with_the_short_read_gap(hsc_module, monkeypatch):
+    """Harm stopped: the scan's >sn read waiting the full 1 s per port, or cutting the answer."""
     import types
-    monkeypatch.setattr(hsc_module, "LASER_SN_TO_CONNECTION", {"1": "YAG_1"})
-    name = hsc_module.MyTableWidget._assignConnectionName
-    assert name(types.SimpleNamespace(), "1") == "YAG_1"
-    assert name(types.SimpleNamespace(), "2") == "SN_2"
+    opened = []
+
+    def fake_serial(dev, *a, **k):
+        opened.append(k)
+        raise OSError("not a laser")
+    monkeypatch.setattr(hsc_module.serial.tools.list_ports, "comports", lambda: [types.SimpleNamespace(device="COM99")])
+    monkeypatch.setattr(hsc_module.serial, "Serial", fake_serial)
+    monkeypatch.setattr(hsc_module, "NOT_LASERS", set())
+    hsc_module.HomeTab._scanPorts(types.SimpleNamespace(devices=[]))
+    assert opened == [{"timeout": 1, "inter_byte_timeout": hsc_module.READ_GAP_S}]

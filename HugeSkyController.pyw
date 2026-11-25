@@ -4,7 +4,7 @@ from PyQt5.QtWidgets import (QMainWindow, QApplication, QPushButton,
  QWidget, QAction, QTabWidget,QVBoxLayout, QGridLayout, QTabBar, QLineEdit, QTextBrowser)
 from PyQt5.QtGui import QIcon, QPixmap
 from PyQt5.QtCore import pyqtSlot, pyqtSignal, QObject
-from BigSkyControllerAmbitious import READ_GAP_S, SingleLaserController, RemoteRefused
+from BigSkyControllerAmbitious import READ_GAP_S, read_reply, SingleLaserController, RemoteRefused
 import serial.tools.list_ports
 import ctypes
 import pickle
@@ -193,17 +193,16 @@ class BigSkyZmqServer(QObject):
 # COM ports that hold other instruments: the port scan never opens them, so ">sn" at 9600 baud
 # never reaches them and the GUI can start before or after BLACS (which holds them) in any order.
 # BeamBox: COM10 the Quantum Composer, COM11 the PrawnBlaster.
-NOT_LASERS = {"COM10", "COM11"}
+NOT_LASERS = {"COM10", "COM11", "COM6"}   # QC, PrawnBlaster, Lake Shore 336 temperature controller
 
 # Edit this dict to match your physical setup.
 # Serial numbers are strings as returned by the >sn command.
+# 151 and 213 are RaX's lasers. BeamBox's (laserNames.pkl): 261 NEPTUNE Ablation, 093 NEPTUNE
+# Ionization, 023 Ablation, 082 a test entry. None is listed yet: a laser not listed gets YAG_1,
+# YAG_2, ... in the order its tab is launched, so launch the laser BLACS drives first.
 LASER_SN_TO_CONNECTION = {
   '151': 'YAG_1',
   '213': 'YAG_2',
-  # SN 082 (label 'sdfhjkasehkfs' in laserNames.pkl — test/typo entry) and
-  # SN 261 (label 'COBRA PUMP' — a different physical laser, not a BLACS-driven YAG)
-  # are intentionally omitted. A laser not listed here opens as SN_<serial>, a name BLACS
-  # does not use, so BLACS's YAG_1 requests never reach the wrong laser.
 }
 
 
@@ -288,7 +287,7 @@ class HomeTab(QWidget):
         continue
       try:
         ser.flush(); ser.write(b'>sn\n')
-        response = ser.read(140).decode('utf-8'); print("response:", response)
+        response = read_reply(ser).decode('utf-8'); print("response:", response)
         if 'number' in response:
           print("yeah this one."); ser.close()
           sn = response.strip('s// number\r\n')
@@ -349,6 +348,7 @@ class MyTableWidget(QWidget):
     #self.tabs.resize(width,height)
     self.homeTab=HomeTab(self, scan=not noLaser)
     print("test: ", len(self.homeTab.buttons))
+    self._laserLaunchOrder = 0   # fallback names YAG_1, YAG_2, ... for lasers not in LASER_SN_TO_CONNECTION
 
     for i in range(len(self.homeTab.buttons)):
       self.homeTab.buttons[i].pressed.connect(lambda i=i: self.createTab(i))
@@ -366,10 +366,12 @@ class MyTableWidget(QWidget):
 
   def _assignConnectionName(self, serialNumber):
     """The BLACS connection name for a laser: LASER_SN_TO_CONNECTION (keyed by serial number),
-    else SN_<serial>. An unknown laser never gets a YAG_N name, so a BLACS request for YAG_1
-    (arm: lamps fire, the shutter opens) cannot reach it because it was launched first."""
+    else YAG_1, YAG_2, ... in launch order."""
     sn = str(serialNumber)
-    return LASER_SN_TO_CONNECTION.get(sn, "SN_%s" % sn)
+    if sn in LASER_SN_TO_CONNECTION:
+      return LASER_SN_TO_CONNECTION[sn]
+    self._laserLaunchOrder += 1
+    return "YAG_%d" % self._laserLaunchOrder
 
   def createTab(self, i):
     com=self.homeTab.devices[i]; labelString=self.homeTab.labelLineEdits[i].text()

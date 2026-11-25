@@ -14,6 +14,15 @@ import threading
 # + 15 characters (CommandsForBigSky.pdf, page 10 of 19): 17 bytes, about 18 ms at 9600 baud.
 READ_GAP_S = 0.05   # [s]
 
+
+def read_reply(ser):
+  """One answer, as bytes. The read ends READ_GAP_S after the last byte. The laser sends CR LF
+  first: if only that came, it may still be working, so read once more."""
+  data = ser.read(140)
+  if data and not data.strip():
+    data += ser.read(140)
+  return data
+
 # Match the trailing integer in a BigSky response (e.g. "LP synch :  1\r\n" → 1).
 # Tolerant of leading/trailing whitespace and varying prefix punctuation so we
 # don't have to hard-code each command's exact response prefix.
@@ -177,7 +186,7 @@ class SingleLaserController(QtWidgets.QWidget, Ui_Widget):
     try:
       self.ser.reset_input_buffer()    # a late answer to an earlier command is not read as this one's
       self.ser.write(cmd_bytes if isinstance(cmd_bytes, bytes) else bytes(cmd_bytes, "utf-8"))
-      response = self.ser.read(140).decode('utf-8')   # ends READ_GAP_S after the last byte
+      response = read_reply(self.ser).decode('utf-8')
       if not response.strip():
         self._consecutiveErrors += 1
         if self._consecutiveErrors >= 3:
@@ -243,7 +252,7 @@ class SingleLaserController(QtWidgets.QWidget, Ui_Widget):
       self.ser = serial.Serial(self.comPort, 9600, timeout=1, inter_byte_timeout=READ_GAP_S)
       self.ser.reset_input_buffer()
       self.ser.write(b'>cg\n')
-      response = self.ser.read(140).decode('utf-8')
+      response = read_reply(self.ser).decode('utf-8')
       temp = float(response.strip('\r\ntemp.CG d'))
       self._handleReconnect(temp)
     except Exception:

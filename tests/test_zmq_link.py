@@ -313,6 +313,7 @@ def test_the_port_scan_never_opens_the_qc_or_prawnblaster_port(hsc_module, monke
 
     monkeypatch.setattr(hsc_module.serial.tools.list_ports, "comports",
                         lambda: [types.SimpleNamespace(device=d) for d in ("COM5", "COM10", "COM11")])
+    monkeypatch.setattr(hsc_module, "NOT_LASERS", {"COM10", "COM11"})       # the test's own list
     monkeypatch.setattr(hsc_module.serial, "Serial", fake_serial)
     hsc_module.HomeTab._scanPorts(types.SimpleNamespace(devices=[]))
     assert opened == ["COM5"]
