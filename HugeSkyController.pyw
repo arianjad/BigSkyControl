@@ -4,7 +4,7 @@ from PyQt5.QtWidgets import (QMainWindow, QApplication, QPushButton,
  QWidget, QAction, QTabWidget,QVBoxLayout, QGridLayout, QTabBar, QLineEdit, QTextBrowser)
 from PyQt5.QtGui import QIcon, QPixmap
 from PyQt5.QtCore import pyqtSlot, pyqtSignal, QObject
-from BigSkyControllerAmbitious import SingleLaserController, RemoteRefused
+from BigSkyControllerAmbitious import READ_GAP_S, SingleLaserController, RemoteRefused
 import serial.tools.list_ports
 import ctypes
 import pickle
@@ -202,10 +202,8 @@ LASER_SN_TO_CONNECTION = {
   '213': 'YAG_2',
   # SN 082 (label 'sdfhjkasehkfs' in laserNames.pkl — test/typo entry) and
   # SN 261 (label 'COBRA PUMP' — a different physical laser, not a BLACS-driven YAG)
-  # are intentionally omitted. If those COM ports are launched, the
-  # _laserLaunchOrder counter fallback applies (identical to pre-2026-05-19 behavior).
-  # Populated 2026-05-19 per refactor plan; previously this dict was empty
-  # placeholder, which made YAG_N assignment deterministic-by-accident only.
+  # are intentionally omitted. A laser not listed here opens as SN_<serial>, a name BLACS
+  # does not use, so BLACS's YAG_1 requests never reach the wrong laser.
 }
 
 
@@ -284,7 +282,7 @@ class HomeTab(QWidget):
         continue  # already known, or another instrument (never sent >sn)
       try:
         print('trying com port %s' % dev)
-        ser = serial.Serial(dev, 9600, timeout=1)
+        ser = serial.Serial(dev, 9600, timeout=1, inter_byte_timeout=READ_GAP_S)
       except:
         print("nope not this one")
         continue
@@ -352,9 +350,6 @@ class MyTableWidget(QWidget):
     self.homeTab=HomeTab(self, scan=not noLaser)
     print("test: ", len(self.homeTab.buttons))
 
-    # Track how many lasers have been launched (for fallback tab-order connection naming)
-    self._laserLaunchOrder = 0
-
     for i in range(len(self.homeTab.buttons)):
       self.homeTab.buttons[i].pressed.connect(lambda i=i: self.createTab(i))
 
@@ -370,14 +365,11 @@ class MyTableWidget(QWidget):
       self._registerLaser("YAG_1", ctrl, "YAG_1 (no laser)")
 
   def _assignConnectionName(self, serialNumber):
-    """Determine the BLACS connection name for a laser.
-    First checks LASER_SN_TO_CONNECTION dict (keyed by serial number).
-    Falls back to tab-order assignment: YAG_1, YAG_2, YAG_3, ..."""
+    """The BLACS connection name for a laser: LASER_SN_TO_CONNECTION (keyed by serial number),
+    else SN_<serial>. An unknown laser never gets a YAG_N name, so a BLACS request for YAG_1
+    (arm: lamps fire, the shutter opens) cannot reach it because it was launched first."""
     sn = str(serialNumber)
-    if sn in LASER_SN_TO_CONNECTION:
-      return LASER_SN_TO_CONNECTION[sn]
-    self._laserLaunchOrder += 1
-    return "YAG_%d" % self._laserLaunchOrder
+    return LASER_SN_TO_CONNECTION.get(sn, "SN_%s" % sn)
 
   def createTab(self, i):
     com=self.homeTab.devices[i]; labelString=self.homeTab.labelLineEdits[i].text()

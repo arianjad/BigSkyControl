@@ -38,6 +38,9 @@ class FakeLaser:
     def flush(self):
         pass
 
+    def reset_input_buffer(self):
+        self._reply = b""
+
     def close(self):
         pass
 

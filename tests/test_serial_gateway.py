@@ -127,3 +127,26 @@ def test_B4_handle_reconnect_resets_consecutive_errors(
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# --- read timing and stale answers ------------------------------------------
+
+def test_each_command_clears_old_input_and_the_port_ends_a_read_at_the_gap(
+        bsa_module, make_controller_self, hsc_module):
+    """Harm stopped: every Big Sky command waiting the full 1 s timeout (each BLACS set or arm
+    step about 1 s late), or a late answer to an earlier command read as this one's."""
+    s = make_controller_self()
+    bsa_module.SingleLaserController._sendCommand(s, b">cg\n")
+    names = [c[0] for c in s.ser.method_calls]
+    assert names.index("reset_input_buffer") < names.index("write") < names.index("read")
+    assert 0 < bsa_module.READ_GAP_S < 1 and hsc_module.READ_GAP_S is bsa_module.READ_GAP_S
+
+
+def test_a_laser_not_in_the_serial_number_list_never_gets_a_yag_name(hsc_module):
+    """Harm stopped: an unknown laser launched first named YAG_1, so BLACS's YAG_1 arm (lamps
+    fire, the shutter opens) goes to the wrong laser."""
+    import types
+    hub = types.SimpleNamespace()
+    name = hsc_module.MyTableWidget._assignConnectionName
+    assert name(hub, "151") == "YAG_1" and name(hub, "082") == "SN_082"
+    assert not name(hub, "999").startswith("YAG_")
