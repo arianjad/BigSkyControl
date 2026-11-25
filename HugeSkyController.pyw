@@ -193,7 +193,7 @@ class BigSkyZmqServer(QObject):
 # COM ports that hold other instruments: the port scan never opens them, so ">sn" at 9600 baud
 # never reaches them and the GUI can start before or after BLACS (which holds them) in any order.
 # BeamBox: COM10 the Quantum Composer, COM11 the PrawnBlaster.
-NOT_LASERS = {"COM10", "COM11", "COM6"}   # QC, PrawnBlaster, Lake Shore 336 temperature controller
+NOT_LASERS = {"COM10", "COM11"}   # QC, PrawnBlaster
 
 # Edit this dict to match your physical setup.
 # Serial numbers are strings as returned by the >sn command.

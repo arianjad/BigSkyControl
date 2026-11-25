@@ -16,7 +16,7 @@ The Big Sky Nd:YAG GUI on the BeamBox lab PC: one window per laser, and the link
 
 ## What can hurt
 
-- **The hub writes `>sn` to every COM port** when it starts and on "Refresh Connections", except the ports in `NOT_LASERS` (COM10 the Quantum Composer, COM11 the PrawnBlaster, COM6 the Lake Shore 336), so it can start before or after BLACS. A new instrument on another COM port gets those bytes: add its port there. `--no-laser` opens no COM port.
+- **The hub writes `>sn` to every COM port** when it starts and on "Refresh Connections", except the ports in `NOT_LASERS` (COM10 the Quantum Composer, COM11 the PrawnBlaster), so it can start before or after BLACS. A new instrument on another COM port gets those bytes: add its port there. `--no-laser` opens no COM port.
 - **The lab runs the GUI from the main folder `GUIs\BigSkyControl`.** Editing files there or switching its branch changes the running program's next start. Work in a git worktree.
 - **A BLACS request moves the laser**: lamps fire, the shutter opens. The ports bind on all network interfaces, so anything that reaches this PC on 55540 can do the same.
 - **Closing a tab or the hub sends `>s`** (standby) to that laser.
